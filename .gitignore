@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# 秘密情報・環境変数は絶対にコミットしない
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store

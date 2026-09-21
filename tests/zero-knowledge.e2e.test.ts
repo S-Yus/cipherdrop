@@ -1,0 +1,285 @@
+/**
+ * Zero-Knowledge の E2E 検証。
+ *
+ * 実際のクライアントコード（暗号化・復号）と実際のサーバー（HTTP）をつなぎ、
+ * 「サーバーが観測できたもの」をすべて記録して、鍵と平文が一度も現れないことを確認する。
+ *   - ネットワーク: サーバーが受信した生の TCP バイト列（リクエスト行・ヘッダー・本文のすべて）
+ *   - ストレージ:   サーバーが保存した内容
+ *   - ログ:         サーバーが出力したログ
+ *
+ * ファイル先頭の sendSecret / receiveSecret は、フロントエンド実装時にそのまま参考にできる利用サンプル
+ * （fetch / URL / crypto.ts などブラウザにもある API だけで書いており、Buffer などの Node 専用 API は使わない）。
+ */
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import type { AddressInfo, Socket } from 'node:net';
+import { describe, it } from 'node:test';
+import type { TestContext } from 'node:test';
+import { HEADER_IV, createServer } from '../apps/backend/src/server.ts';
+import type { LogEvent } from '../apps/backend/src/server.ts';
+import { InMemoryPayloadStore } from '../apps/backend/src/store.ts';
+import type { StoredPayload } from '../apps/backend/src/store.ts';
+import { CipherDropCryptoError, base64UrlDecode, base64UrlEncode, decryptData, encryptData } from '../apps/frontend/src/crypto.ts';
+
+const SHARE_ORIGIN = 'https://cipherdrop.io';
+
+// ---------------------------------------------------------------------------
+// 利用サンプル: 送信者と受信者のブラウザが行う処理
+// ---------------------------------------------------------------------------
+
+/** 送信者: 暗号化 → 暗号文と IV だけを送信 → 共有 URL（鍵は # 以降）を組み立てる。 */
+async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Promise<string> {
+  const { encryptedData, iv, keyString } = await encryptData(payload);
+
+  const response = await fetch(`${apiOrigin}/api/payload`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream', [HEADER_IV]: base64UrlEncode(iv) },
+    body: encryptedData,
+  });
+  assert.equal(response.status, 201);
+  const { id } = (await response.json()) as { id: string };
+
+  return `${SHARE_ORIGIN}/v/${id}#${keyString}`;
+}
+
+/** 受信者: 共有 URL から ID と鍵を取り出し → 暗号文を取得（サーバー側で削除される）→ 復号する。 */
+async function receiveSecret(apiOrigin: string, shareUrl: string): Promise<string | ArrayBuffer> {
+  const link = new URL(shareUrl);
+  const id = link.pathname.split('/').pop() ?? '';
+  const keyString = link.hash.slice(1);
+
+  // フラグメントを付けたまま渡しても、fetch はブラウザと同様に HTTP リクエストへ載せない。
+  const response = await fetch(`${apiOrigin}/api/payload/${id}${link.hash}`);
+  if (response.status !== 200) throw new Error(`fetch failed with status ${response.status}`);
+
+  const iv = base64UrlDecode(response.headers.get(HEADER_IV) ?? '');
+  if (iv === null) throw new Error('invalid IV header');
+  return decryptData(await response.arrayBuffer(), iv, keyString);
+}
+
+// ---------------------------------------------------------------------------
+// 観測用の部品
+// ---------------------------------------------------------------------------
+
+/** サーバーが保存した内容を記録するストア。 */
+class RecordingStore extends InMemoryPayloadStore {
+  readonly puts: StoredPayload[] = [];
+
+  override async put(id: string, payload: StoredPayload, ttlSeconds: number) {
+    this.puts.push({ ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv) });
+    return super.put(id, payload, ttlSeconds);
+  }
+}
+
+/** 取得時に暗号文を 1 ビット書き換える、悪意あるサーバーのストア。 */
+class TamperingStore extends RecordingStore {
+  override async take(id: string) {
+    const payload = await super.take(id);
+    if (payload === null) return null;
+    const ciphertext = new Uint8Array(payload.ciphertext);
+    ciphertext[0] = (ciphertext[0] ?? 0) ^ 0x01;
+    return { ciphertext, iv: payload.iv };
+  }
+}
+
+async function startWorld<S extends RecordingStore = RecordingStore>(t: TestContext, createStore?: () => S) {
+  const store = createStore ? createStore() : (new RecordingStore({ sweepIntervalMs: 0 }) as S);
+  const logs: LogEvent[] = [];
+  const wire: Buffer[] = []; // サーバーが全接続で受信した生バイト列
+
+  const server = createServer({ store, log: (event) => logs.push(event) });
+  server.on('connection', (socket: Socket) => {
+    socket.on('data', (chunk: Buffer) => wire.push(chunk));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    store.close();
+  });
+
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return { origin, store, logs, observedOnWire: () => Buffer.concat(wire) };
+}
+
+interface ObservedRequest {
+  method: string;
+  target: string;
+  /** リクエスト行 + ヘッダー部（本文を含まない）。 */
+  head: string;
+  /** ヘッダー名は小文字。 */
+  headers: Map<string, string>;
+  body: Buffer;
+}
+
+/** 記録した生ストリームを HTTP/1.1 リクエストの列として読む（本文は Content-Length で切り出す）。 */
+function parseHttpRequests(stream: Buffer): ObservedRequest[] {
+  const requests: ObservedRequest[] = [];
+  let offset = 0;
+  while (offset < stream.length) {
+    const headEnd = stream.indexOf('\r\n\r\n', offset);
+    assert.ok(headEnd >= 0, '途中で切れたリクエストが記録されている');
+
+    const head = stream.subarray(offset, headEnd).toString('latin1');
+    const [requestLine = '', ...headerLines] = head.split('\r\n');
+    const [method = '', target = ''] = requestLine.split(' ');
+    const headers = new Map<string, string>();
+    for (const line of headerLines) {
+      const colon = line.indexOf(':');
+      headers.set(line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim());
+    }
+
+    const bodyStart = headEnd + 4;
+    const bodyLength = Number(headers.get('content-length') ?? 0);
+    requests.push({ method, target, head, headers, body: stream.subarray(bodyStart, bodyStart + bodyLength) });
+    offset = bodyStart + bodyLength;
+  }
+  return requests;
+}
+
+/** 秘密の値が、よくある符号化のどれかで観測データに含まれていないかを返す。 */
+function leakedForms(observed: Buffer, secret: Buffer, label: string): string[] {
+  const forms: Array<[string, Buffer | string]> = [
+    [`${label} (raw)`, secret],
+    [`${label} (hex)`, secret.toString('hex')],
+    [`${label} (base64)`, secret.toString('base64')],
+    [`${label} (base64url)`, secret.toString('base64url')],
+  ];
+  return forms.filter(([, needle]) => observed.includes(needle)).map(([name]) => name);
+}
+
+// ---------------------------------------------------------------------------
+// テスト
+// ---------------------------------------------------------------------------
+
+describe('E2E: Zero-Knowledge・1 回読み切り', () => {
+  const message = 'マイナンバー 123456789012 / 口座 0123-4567 / top-secret-passphrase <img src=x onerror=alert(1)>';
+
+  it('送信 → 受信で元の文章に戻り、2 回目は取得できない', async (t) => {
+    const world = await startWorld(t);
+
+    const shareUrl = await sendSecret(world.origin, message);
+    assert.match(shareUrl, /^https:\/\/cipherdrop\.io\/v\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}$/);
+
+    assert.equal(await receiveSecret(world.origin, shareUrl), message);
+    assert.equal(world.store.size, 0, '取得後、サーバーには何も残らない');
+    await assert.rejects(receiveSecret(world.origin, shareUrl), /status 404/);
+  });
+
+  it('サーバーが観測できる全データ（通信・保存・ログ）に、鍵も平文も一度も現れない', async (t) => {
+    const world = await startWorld(t);
+
+    const shareUrl = await sendSecret(world.origin, message);
+    const link = new URL(shareUrl);
+    const keyString = link.hash.slice(1);
+    const id = link.pathname.split('/').pop() ?? '';
+
+    // 共有リンクを開いたブラウザがサーバーへ送る 2 種類のリクエスト:
+    //  1. ページの取得（GET /v/{id}#{key}）… このテスト用サーバーは API だけなので 404 だが、送信内容は記録される
+    await fetch(`${world.origin}${link.pathname}${link.hash}`);
+    //  2. ページ上の JS による暗号文の取得（フラグメント付きのまま fetch に渡す）
+    assert.equal(await receiveSecret(world.origin, shareUrl), message);
+
+    const observed = world.observedOnWire();
+    const text = observed.toString('latin1');
+    const stored = world.store.puts[0];
+    assert.ok(stored);
+
+    // 記録は本文（ランダムな暗号文）を含む生ストリームなので、「# が無い」のような 1 文字の検査を全体にかけると偶然一致で
+    // 不安定になる。リクエストとして構造的にパースし、リクエスト行・ヘッダー部と本文を分けて検査する。
+    const requests = parseHttpRequests(observed);
+
+    // --- 陽性対照: 記録の仕組みが空振りしていないこと（見えるべきものは見えている）---
+    // サーバーが受け取ったリクエストは、この 3 本だけ。パスに鍵はなく、クエリもフラグメントもない。
+    assert.deepEqual(
+      requests.map((r) => `${r.method} ${r.target}`),
+      ['POST /api/payload', `GET /v/${id}`, `GET /api/payload/${id}`],
+    );
+    const [upload] = requests;
+    assert.ok(upload);
+    assert.deepEqual(new Uint8Array(upload.body), stored.ciphertext, 'アップロード本文は暗号文そのもの');
+    assert.equal(upload.headers.get(HEADER_IV), base64UrlEncode(stored.iv), 'IV はヘッダーに現れる');
+    assert.deepEqual(requests.slice(1).map((r) => r.body.length), [0, 0], 'GET は本文を持たない');
+
+    // --- 通信: 鍵はどんな形でも現れない ---
+    const rawKey = Buffer.from(keyString, 'base64url');
+    assert.equal(rawKey.length, 32);
+    assert.deepEqual(leakedForms(observed, rawKey, '鍵'), []);
+    const headSections = requests.map((r) => r.head).join('\n');
+    assert.ok(!headSections.includes('#'), 'リクエスト行・ヘッダーにフラグメント区切りの # がない');
+    assert.ok(!headSections.includes('?'), 'リクエスト行・ヘッダーにクエリがない');
+    for (let i = 0; i + 12 <= keyString.length; i++) {
+      assert.ok(!text.includes(keyString.slice(i, i + 12)), `鍵の一部 (${i}〜) が通信に現れている`);
+    }
+
+    // --- 通信: 平文もどんな形でも現れない ---
+    assert.deepEqual(leakedForms(observed, Buffer.from(message), '平文'), []);
+    for (const fragment of ['123456789012', 'top-secret-passphrase', '口座', 'onerror']) {
+      assert.ok(!observed.includes(fragment), `平文の断片 "${fragment}" が通信に現れている`);
+    }
+
+    // --- 保存: サーバーが持っていたのは暗号文と IV だけで、そこにも鍵・平文はない ---
+    assert.equal(world.store.puts.length, 1);
+    assert.deepEqual(Object.keys(stored).sort(), ['ciphertext', 'iv']);
+    const storedBytes = Buffer.concat([stored.ciphertext, stored.iv]);
+    assert.deepEqual(leakedForms(storedBytes, rawKey, '鍵'), []);
+    assert.deepEqual(leakedForms(storedBytes, Buffer.from(message), '平文'), []);
+
+    // --- ログ: 鍵・平文・ID のいずれも出ていない ---
+    const logText = JSON.stringify(world.logs);
+    for (const secret of [keyString, id, 'top-secret-passphrase', '123456789012']) {
+      assert.ok(!logText.includes(secret), `ログに "${secret.slice(0, 8)}…" が含まれている`);
+    }
+  });
+
+  it('（検出力の確認）鍵をクエリに載せる実装ミスがあれば通信記録に鍵が現れ、サーバーは 400 で拒否する', async (t) => {
+    const world = await startWorld(t);
+    const shareUrl = await sendSecret(world.origin, message);
+    const link = new URL(shareUrl);
+    const keyString = link.hash.slice(1);
+    const id = link.pathname.split('/').pop() ?? '';
+
+    const buggy = await fetch(`${world.origin}/api/payload/${id}?key=${keyString}`); // NG な実装
+    assert.equal(buggy.status, 400);
+    assert.ok(world.observedOnWire().includes(keyString), '鍵が漏れる実装なら、この検査方法で検出できる');
+    assert.equal(world.store.size, 1, '拒否されたので暗号文は消費されていない');
+
+    assert.equal(await receiveSecret(world.origin, shareUrl), message, '正しい手順ならまだ読める');
+  });
+
+  it('バイナリ（2MiB のファイル相当）も同様に往復でき、2 回目は取得できない', async (t) => {
+    const world = await startWorld(t);
+    const file = Uint8Array.from(randomBytes(2 * 1024 * 1024)).buffer;
+
+    const shareUrl = await sendSecret(world.origin, file);
+    const received = await receiveSecret(world.origin, shareUrl);
+
+    assert.ok(received instanceof ArrayBuffer);
+    assert.deepEqual(new Uint8Array(received), new Uint8Array(file));
+    await assert.rejects(receiveSecret(world.origin, shareUrl), /status 404/);
+  });
+
+  it('URL の鍵が違えば、暗号文を取得できても復号できない（サーバーは鍵を持たないので代わりに復号もできない）', async (t) => {
+    const world = await startWorld(t);
+    const shareUrl = await sendSecret(world.origin, message);
+    const otherKey = new URL(await sendSecret(world.origin, 'another secret')).hash;
+
+    const wrongLink = `${shareUrl.split('#')[0]}${otherKey}`;
+    await assert.rejects(receiveSecret(world.origin, wrongLink), (error: unknown) => {
+      assert.ok(error instanceof CipherDropCryptoError);
+      assert.equal(error.code, 'DECRYPTION_FAILED');
+      return true;
+    });
+  });
+
+  it('悪意あるサーバーが暗号文を改ざんしても、受信者は検出できる（内容を偽造できない）', async (t) => {
+    const world = await startWorld(t, () => new TamperingStore({ sweepIntervalMs: 0 }));
+    const shareUrl = await sendSecret(world.origin, message);
+
+    await assert.rejects(receiveSecret(world.origin, shareUrl), (error: unknown) => {
+      assert.ok(error instanceof CipherDropCryptoError);
+      assert.equal(error.code, 'DECRYPTION_FAILED');
+      return true;
+    });
+  });
+});

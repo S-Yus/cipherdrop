@@ -1,0 +1,11 @@
+{
+  // 複数アプリを横断するテスト（E2E / セキュリティポリシー）用。
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"]
+  },
+  "include": ["./**/*.ts"]
+}

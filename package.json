@@ -1,0 +1,23 @@
+{
+  "name": "cipherdrop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-knowledge, one-time, self-destructing data sharing.",
+  "type": "module",
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=24.2.0"
+  },
+  "scripts": {
+    "dev:backend": "npm run dev --workspace @cipherdrop/backend",
+    "typecheck": "npm run typecheck --workspaces && tsc -p tests/tsconfig.json",
+    "test": "node --test \"apps/*/src/**/*.test.ts\" \"tests/**/*.test.ts\"",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.6",
+    "typescript": "6.0.3"
+  }
+}

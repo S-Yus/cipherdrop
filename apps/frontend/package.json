@@ -1,0 +1,15 @@
+{
+  "name": "@cipherdrop/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CipherDrop client: all encryption and decryption happens in the browser (Web Crypto API).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "node --test \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/jsdom": "30.0.0",
+    "jsdom": "30.1.0"
+  }
+}

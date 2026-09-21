@@ -1,0 +1,9 @@
+{
+  // テストは Node 上（node:test + jsdom）で実行するため Node の型を追加する。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": []
+}

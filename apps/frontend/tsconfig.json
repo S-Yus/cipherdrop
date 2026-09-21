@@ -1,0 +1,11 @@
+{
+  // ブラウザ専用の型環境。types: [] のため Buffer / process などの Node API を
+  // うっかり使うとここで型エラーになる（crypto.ts をブラウザで動く状態に保つための番人）。
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}
