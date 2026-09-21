@@ -26,6 +26,9 @@ function open(sealed: EncryptedPayload, options: { type?: 'text' | 'file'; key?:
 const methods = (t: { calls: ApiCall[] }) => t.calls.map((call) => call.method);
 const openButton = (t: { main: HTMLElement }) => query<HTMLButtonElement>(t.main, '[data-action="open"]');
 const settle = () => new Promise((resolve) => setTimeout(resolve, 40));
+/** 確認画面の dl（種類・サイズ・有効期限・暗号方式）を { 見出し: 値 } にする。 */
+const rows = (t: { main: HTMLElement }): Record<string, string> =>
+  Object.fromEntries([...t.main.querySelectorAll('dl > div')].map((row) => [row.querySelector('dt')?.textContent ?? '', row.querySelector('dd')?.textContent ?? '']));
 
 /** 確認画面（Stage 1）が表示されるまで待つ。 */
 async function untilConfirm(t: { main: HTMLElement }): Promise<void> {
@@ -42,12 +45,14 @@ describe('受取画面 Stage 1（確認）: 開いただけでは何も消費し
     assert.deepEqual(methods(t), ['getMeta'], 'meta だけ');
     assert.deepEqual(t.calls[0]?.args, [SAMPLE_ID]);
 
-    const text = t.main.textContent ?? '';
-    assert.match(text, /このデータは一度開くとサーバーから永久に消滅します/);
-    assert.match(text, /テキストメッセージ/);
-    assert.match(text, new RegExp(`${sealed.encryptedData.byteLength} B`), '暗号文のサイズ');
-    assert.match(text, /あと 23時間/, '有効期限までの残り時間');
-    assert.equal(openButton(t).textContent, 'データを開く');
+    const shown = rows(t);
+    assert.equal(query(t.main, 'h1').textContent, '受信データ');
+    assert.equal(shown['種類'], 'テキスト');
+    assert.equal(shown['サイズ'], `${sealed.encryptedData.byteLength} B`, '暗号文のサイズ');
+    assert.match(shown['有効期限'] ?? '', /あと 23時間/, '有効期限までの残り時間');
+    assert.equal(shown['暗号方式'], 'AES-256-GCM');
+    assert.match(t.main.textContent ?? '', /このデータは一度開くとサーバーから永久削除されます/);
+    assert.equal(openButton(t).textContent, 'データを復号して表示');
     assert.equal(has(t.main, '[data-testid="decrypted-text"]'), false, '内容はまだ表示しない');
   });
 
@@ -61,13 +66,13 @@ describe('受取画面 Stage 1（確認）: 開いただけでは何も消費し
     for (const t of opened) assert.deepEqual(methods(t), ['getMeta']);
   });
 
-  it('ファイルの確認画面: 種類は「ファイル」、ボタンは「ファイルをダウンロード」', async () => {
+  it('ファイルの確認画面: 種類は「ファイル」、ボタンは「データを復号してダウンロード」', async () => {
     const sealed = await encryptFile({ name: '契約書.pdf', data: new ArrayBuffer(10) });
     const t = open(sealed, { type: 'file' });
     await untilConfirm(t);
 
-    assert.match(t.main.textContent ?? '', /ファイルを受け取る/);
-    assert.equal(openButton(t).textContent, 'ファイルをダウンロード');
+    assert.equal(rows(t)['種類'], 'ファイル');
+    assert.equal(openButton(t).textContent, 'データを復号してダウンロード');
     assert.doesNotMatch(t.main.textContent ?? '', /契約書/, '確認画面（サーバー由来の情報）にファイル名は現れない');
   });
 
@@ -88,7 +93,7 @@ describe('受取画面 Stage 1（確認）: 開いただけでは何も消費し
     });
     mountApp(t.env);
 
-    assert.match(query(t.main, '[role="status"]').textContent ?? '', /確認しています/);
+    assert.match(query(t.main, '[role="status"]').textContent ?? '', /確認中/);
     assert.equal(has(t.main, '[data-action="open"]'), false);
     release();
     await waitFor(() => has(t.main, '[data-action="open"]'));
@@ -109,8 +114,8 @@ describe('受取画面 Stage 2（消費・復号）: 「開く」を押したと
     assert.deepEqual(methods(t), ['getMeta', 'consume']);
     assert.equal(t.window.location.hash, '', '取得（消滅）後は、URL から鍵を消す');
     assert.equal(t.window.location.pathname, `/v/${SAMPLE_ID}`);
-    assert.match(t.main.textContent ?? '', /このデータはサーバーから削除されました/);
-    assert.equal(t.doc.activeElement?.tagName, 'H2', '結果の見出しにフォーカスが移る');
+    assert.match(t.main.textContent ?? '', /サーバー上のデータは削除済みです/);
+    assert.equal(t.doc.activeElement?.tagName, 'H1', '結果の見出しにフォーカスが移る');
   });
 
   it('HTML・スクリプトを含むテキストは、要素にならず文字のまま表示される（XSS 対策）', async () => {
@@ -150,7 +155,7 @@ describe('受取画面 Stage 2（消費・復号）: 「開く」を押したと
     const button = openButton(t);
     click(button);
     click(button); // ダブルクリック
-    await waitFor(() => openButton(t).textContent?.includes('復号しています'));
+    await waitFor(() => openButton(t).textContent?.includes('取得・復号中'));
     assert.equal(openButton(t).disabled, true);
 
     release();
@@ -168,9 +173,9 @@ describe('受取画面 Stage 2（消費・復号）: 「開く」を押したと
     click(copy);
     await waitFor(() => t.clipboardWrites.length === 1);
     assert.deepEqual(t.clipboardWrites, ['コピーする本文']);
-    assert.match(copy.textContent ?? '', /コピーしました/);
+    assert.equal(copy.textContent, 'コピーしました');
     t.runTimers();
-    assert.match(copy.textContent ?? '', /テキストをコピー/);
+    assert.equal(copy.textContent, 'コピー');
   });
 
   it('クリップボードが使えなくても、失敗を伝えるだけで画面は壊れない', async () => {
@@ -180,7 +185,7 @@ describe('受取画面 Stage 2（消費・復号）: 「開く」を押したと
     await waitFor(() => has(t.main, '[data-action="copy-text"]'));
 
     click(query(t.main, '[data-action="copy-text"]'));
-    await waitFor(() => /コピーできませんでした/.test(t.main.textContent ?? ''));
+    await waitFor(() => /コピーできません/.test(t.main.textContent ?? ''));
   });
 });
 
@@ -206,13 +211,13 @@ describe('受取画面: ファイル', () => {
   });
 
   it('悪意のあるファイル名は無害化してから保存・表示する（パス・双方向制御文字・NUL）', async () => {
-    const t = open(await encryptFile({ name: '../../evil‮fdp.exe', data: new ArrayBuffer(4) }), { type: 'file' });
+    const t = open(await encryptFile({ name: '../../evil\u202Efdp.exe', data: new ArrayBuffer(4) }), { type: 'file' });
     await untilConfirm(t);
     click(openButton(t));
     await waitFor(() => has(t.main, '[data-testid="received-file-name"]'));
 
     const savedName = t.saved[0]?.name ?? '';
-    assert.doesNotMatch(savedName, /[\\/‮]/u);
+    assert.doesNotMatch(savedName, /[\\/\u202E]/u);
     assert.doesNotMatch(savedName, /^\./);
     assert.equal(query(t.main, '[data-testid="received-file-name"]').textContent, savedName, '表示名と保存名は同じ');
   });
@@ -222,13 +227,13 @@ describe('受取画面: ファイル', () => {
     await untilConfirm(risky);
     click(openButton(risky));
     await waitFor(() => has(risky.main, '[data-testid="received-file-name"]'));
-    assert.match(risky.main.textContent ?? '', /実行ファイルやスクリプトの可能性があります/);
+    assert.match(risky.main.textContent ?? '', /実行ファイルまたはスクリプトの可能性があります/);
 
     const safe = open(await encryptFile({ name: 'report.pdf', data: new ArrayBuffer(4) }), { type: 'file' });
     await untilConfirm(safe);
     click(openButton(safe));
     await waitFor(() => has(safe.main, '[data-testid="received-file-name"]'));
-    assert.doesNotMatch(safe.main.textContent ?? '', /実行ファイルやスクリプトの可能性/);
+    assert.doesNotMatch(safe.main.textContent ?? '', /実行ファイルまたはスクリプトの可能性/);
   });
 
   it('自動ダウンロードが失敗した場合は、その旨を伝え、ボタンでもう一度保存できる', async () => {
@@ -287,7 +292,7 @@ describe('受取画面: 不完全なリンクは、消費する前に止める�
     ];
     for (const [label, badKey] of badKeys) {
       const t = open(sealed, { key: badKey });
-      assert.match(t.main.textContent ?? '', /リンクが正しくありません/, label);
+      assert.match(t.main.textContent ?? '', /リンクが不正です/, label);
       assert.equal(t.calls.length, 0, `${label}: API を呼んでいない`);
       assert.equal(has(t.main, '[data-action="open"]'), false, label);
     }
@@ -296,7 +301,7 @@ describe('受取画面: 不完全なリンクは、消費する前に止める�
   it('ID の形式が不正なパス（/v/short）も同様に止める', async () => {
     const sealed = await encryptData('x');
     const t = open(sealed, { path: '/v/short' });
-    assert.match(t.main.textContent ?? '', /リンクが正しくありません/);
+    assert.match(t.main.textContent ?? '', /リンクが不正です/);
     assert.equal(t.calls.length, 0);
   });
 });
@@ -312,7 +317,7 @@ describe('受取画面: エラー', () => {
       },
     });
     mountApp(t.env);
-    await waitFor(() => /このリンクは無効です/.test(t.main.textContent ?? ''));
+    await waitFor(() => /データが存在しません/.test(t.main.textContent ?? ''));
     assert.deepEqual(t.calls.map((call) => call.method), ['getMeta']);
   });
 
@@ -330,7 +335,7 @@ describe('受取画面: エラー', () => {
     mountApp(t.env);
     await waitFor(() => has(t.main, '[data-action="open"]'));
     click(query(t.main, '[data-action="open"]'));
-    await waitFor(() => /このリンクは無効です/.test(t.main.textContent ?? ''));
+    await waitFor(() => /データが存在しません/.test(t.main.textContent ?? ''));
   });
 
   it('meta の通信エラーは再試行できる', async () => {
@@ -347,7 +352,7 @@ describe('受取画面: エラー', () => {
     });
     mountApp(t.env);
 
-    await waitFor(() => /サーバーに接続できませんでした/.test(t.main.textContent ?? ''));
+    await waitFor(() => /サーバーに接続できません/.test(t.main.textContent ?? ''));
     click(query(t.main, '[data-action="retry"]'));
     await waitFor(() => has(t.main, '[data-action="open"]'));
     assert.equal(attempts, 2);
@@ -370,7 +375,7 @@ describe('受取画面: エラー', () => {
     await waitFor(() => has(t.main, '[data-action="open"]'));
 
     click(query(t.main, '[data-action="open"]'));
-    await waitFor(() => /データを取得できませんでした/.test(t.main.textContent ?? ''));
+    await waitFor(() => /取得に失敗しました/.test(t.main.textContent ?? ''));
     assert.equal(t.window.location.hash, `#${sealed.keyString}`, '取得に失敗した間は鍵を消さない');
 
     click(query(t.main, '[data-action="retry-open"]'));
@@ -387,8 +392,8 @@ describe('受取画面: エラー', () => {
     await untilConfirm(t);
     click(openButton(t));
 
-    await waitFor(() => /データを復号できませんでした/.test(t.main.textContent ?? ''));
-    assert.match(t.main.textContent ?? '', /すでにサーバーから削除されています/);
+    await waitFor(() => /復号に失敗しました/.test(t.main.textContent ?? ''));
+    assert.match(t.main.textContent ?? '', /サーバー上のデータは削除済みです/);
     assert.equal(t.window.location.hash, '');
     assert.equal(has(t.main, '[data-testid="decrypted-text"]'), false);
     assert.doesNotMatch(t.main.textContent ?? '', /本文/);
@@ -406,7 +411,7 @@ describe('受取画面: エラー', () => {
     await waitFor(() => has(t.main, '[data-action="open"]'));
     click(query(t.main, '[data-action="open"]'));
 
-    await waitFor(() => /データを復号できませんでした/.test(t.main.textContent ?? ''));
+    await waitFor(() => /復号に失敗しました/.test(t.main.textContent ?? ''));
     assert.doesNotMatch(t.main.textContent ?? '', /改ざんされる/);
   });
 
@@ -430,5 +435,101 @@ describe('受取画面: エラー', () => {
     release();
     await settle();
     assert.equal(t.root.childNodes.length, 0);
+  });
+});
+
+describe('受取画面: 破棄（表示中のデータを画面から消去する）', () => {
+  async function openedText(text: string) {
+    const t = open(await encryptData(text));
+    await untilConfirm(t);
+    click(openButton(t));
+    await waitFor(() => has(t.main, '[data-testid="decrypted-text"]'));
+    return t;
+  }
+
+  it('「破棄」を 1 回押すと、本文が画面から消え、「破棄しました」に切り替わる。再表示できない', async () => {
+    const t = await openedText('破棄される本文 SECRET-BODY');
+    const before = t.calls.length;
+
+    click(query(t.main, '[data-action="discard"]'));
+
+    assert.equal(query(t.main, 'h1').textContent, '破棄しました');
+    assert.equal((t.main.textContent ?? '').includes('SECRET-BODY'), false, '本文が DOM に残らない');
+    assert.equal(has(t.main, '[data-testid="decrypted-text"]'), false);
+    assert.equal(has(t.main, '[data-action="copy-text"]'), false);
+    assert.equal(t.doc.activeElement?.tagName, 'H1');
+    assert.match(t.main.textContent ?? '', /サーバー上のデータは削除済みのため、再表示できません/);
+    assert.equal(t.calls.length, before, '破棄は API を呼ばない');
+  });
+
+  it('破棄のあとにコピー表示のタイマーが動いても、例外にならず画面は「破棄しました」のまま', async () => {
+    const t = await openedText('x');
+    click(query(t.main, '[data-action="copy-text"]'));
+    await waitFor(() => t.clipboardWrites.length === 1);
+    click(query(t.main, '[data-action="discard"]'));
+
+    assert.doesNotThrow(() => t.runTimers());
+    assert.equal(query(t.main, 'h1').textContent, '破棄しました');
+  });
+
+  it('ファイルも「破棄」できる。ファイル名・バイト列への参照が画面から消え、再ダウンロードできない', async () => {
+    const t = open(await encryptFile({ name: 'secret-plan.pdf', data: new ArrayBuffer(8) }), { type: 'file' });
+    await untilConfirm(t);
+    click(openButton(t));
+    await waitFor(() => has(t.main, '[data-testid="received-file-name"]'));
+    assert.equal(t.saved.length, 1);
+
+    click(query(t.main, '[data-action="discard"]'));
+    assert.equal(query(t.main, 'h1').textContent, '破棄しました');
+    assert.equal((t.main.textContent ?? '').includes('secret-plan'), false);
+    assert.equal(has(t.main, '[data-action="download-again"]'), false);
+  });
+
+  it('復号結果には「コピー」と「破棄」の 2 つの操作がある（同じ大きさの副次ボタン）', async () => {
+    const t = await openedText('x');
+    assert.equal(query(t.main, '[data-action="copy-text"]').textContent, 'コピー');
+    assert.equal(query(t.main, '[data-action="discard"]').textContent, '破棄');
+    assert.match(t.main.textContent ?? '', /破棄すると再表示できません/);
+  });
+});
+
+describe('受取画面: デザイン規則（事実だけを、静かに伝える）', () => {
+  it('Stage 1 の警告は amber の静かな通知（border-amber-500/20 bg-amber-500/5）で、事実だけを伝える。赤い警告は使わない', async () => {
+    const t = open(await encryptData('x'));
+    await untilConfirm(t);
+
+    const note = query(t.main, '[role="note"]');
+    assert.ok(note.classList.contains('border-amber-500/20') && note.classList.contains('bg-amber-500/5'));
+    assert.equal(query(note, 'p').textContent, 'このデータは一度開くとサーバーから永久削除されます');
+    assert.equal(note.querySelectorAll('p').length, 2, '事実の 1 文と、実行時点の 1 文だけ');
+    assert.equal(t.main.querySelector('[class*="red-"]'), null, 'Stage 1 に赤は使わない');
+  });
+
+  it('確認画面の値（種類・サイズ・有効期限・暗号方式）は等幅。箇条書き・特長欄・フッターはない', async () => {
+    const t = open(await encryptData('x'));
+    await untilConfirm(t);
+
+    const values = [...t.main.querySelectorAll('dd')];
+    assert.equal(values.length, 4);
+    for (const dd of values) assert.ok(dd.classList.contains('font-mono'));
+    assert.equal(t.doc.querySelectorAll('ul, ol, footer').length, 0);
+  });
+
+  it('復号したテキストは、安全なテキストノードとして等幅のコードブロックに表示される', async () => {
+    const t = open(await encryptData('<b>bold</b> ID: 0123'));
+    await untilConfirm(t);
+    click(openButton(t));
+    const output = await waitFor(() => t.main.querySelector('[data-testid="decrypted-text"]'));
+
+    assert.equal(output.tagName, 'PRE');
+    for (const name of ['font-mono', 'bg-zinc-950', 'border-zinc-800']) assert.ok(output.classList.contains(name), name);
+    assert.equal(output.children.length, 0);
+    assert.equal(query(t.main, '[data-testid="decrypted-size"]').textContent, 'テキスト · 20 B');
+  });
+
+  it('エラー表示は、赤く塗りつぶさず 1px の枠線と 5% の面だけ（border-red-500/20 bg-red-500/5）', async () => {
+    const t = open(await encryptData('x'), { key: 'A'.repeat(20) });
+    const alert = query(t.main, '[role="alert"]');
+    assert.ok(alert.classList.contains('border-red-500/20') && alert.classList.contains('bg-red-500/5'));
   });
 });

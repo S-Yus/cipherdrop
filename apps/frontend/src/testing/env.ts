@@ -17,9 +17,6 @@ export interface TestEnvOptions {
   /** 上書きする API。指定しなかったメソッドは、既定の振る舞い（作成は成功、meta / consume は 404）になる。 */
   api?: Partial<ApiClient>;
   clipboard?: 'ok' | 'fail' | 'none';
-  prefersDark?: boolean;
-  /** true にすると localStorage が使えない環境（storage: null）を再現する。 */
-  noStorage?: boolean;
   saveFileThrows?: boolean;
 }
 
@@ -58,7 +55,6 @@ export function createTestEnv(options: TestEnvOptions = {}) {
 
   const saved: Array<{ name: string; data: ArrayBuffer }> = [];
   const clipboardWrites: string[] = [];
-  const storageMap = new Map<string, string>();
   const timers = new Map<number, () => void>();
   let nextTimer = 1;
   let now = NOW;
@@ -82,8 +78,6 @@ export function createTestEnv(options: TestEnvOptions = {}) {
       if (options.saveFileThrows) throw new Error('blocked');
       saved.push({ name, data });
     },
-    storage: options.noStorage ? null : { getItem: (key) => storageMap.get(key) ?? null, setItem: (key, value) => void storageMap.set(key, value) },
-    prefersDark: () => options.prefersDark ?? false,
     now: () => now,
     setTimeout(handler) {
       const id = nextTimer++;
@@ -104,7 +98,6 @@ export function createTestEnv(options: TestEnvOptions = {}) {
     calls,
     saved,
     clipboardWrites,
-    storageMap,
     /** 予約されているタイマーをすべて実行する（コピー表示の復帰など）。 */
     runTimers() {
       const pending = [...timers.values()];

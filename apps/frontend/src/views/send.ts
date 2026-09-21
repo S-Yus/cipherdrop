@@ -1,7 +1,7 @@
 /**
  * 送信画面（/）。
  *
- * 入力（メッセージ or ファイル）をブラウザ内で暗号化し、暗号文と IV だけをサーバーへ送る。
+ * 入力（テキスト or ファイル）をブラウザ内で暗号化し、暗号文と IV だけをサーバーへ送る。
  * 復号鍵は共有リンクの `#` 以降にだけ載せ、サーバーには送らない（api.ts の関数は鍵を受け取れない）。
  */
 import { ApiError } from '../api.ts';
@@ -11,9 +11,8 @@ import { createDom, cx } from '../dom.ts';
 import type { AppEnv, ViewHandle } from '../env.ts';
 import { formatBytes, formatDateTime, formatRemaining } from '../format.ts';
 import { createIcon } from '../icons.ts';
-import type { IconName } from '../icons.ts';
 import { DEFAULT_TTL_SECONDS, MAX_UPLOAD_BYTES, TTL_OPTIONS } from '../limits.ts';
-import { button, notice, ui } from '../ui.ts';
+import { button, notice, statusBadge, ui } from '../ui.ts';
 
 type Mode = 'text' | 'file';
 
@@ -35,17 +34,22 @@ type Phase = { name: 'editing'; message: FormMessage | null } | { name: 'encrypt
 
 const COPY_FEEDBACK_MS = 2_500;
 const COPY_LABEL = 'リンクをコピー';
+/** コピー結果の表示。空のときは高さを取らない（empty:mt-0）が、aria-live の領域としては常に存在させる。 */
+const STATUS_OK = 'mt-2 text-sm text-emerald-400 empty:mt-0';
+const STATUS_FAILED = 'mt-2 text-sm text-red-400 empty:mt-0';
 
 export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
   const dom = createDom(env.doc);
-  const state: { mode: Mode; text: string; file: File | null; ttlSeconds: number } = {
+  const state: { mode: Mode; text: string; textBytes: number; file: File | null; ttlSeconds: number } = {
     mode: 'text',
     text: '',
+    textBytes: 0,
     file: null,
     ttlSeconds: DEFAULT_TTL_SECONDS,
   };
   let phase: Phase = { name: 'editing', message: null };
   let submitButton: HTMLButtonElement | null = null;
+  let byteCounter: HTMLElement | null = null;
   let pendingFocus: string | null = null;
   let feedbackTimer: unknown = null;
   let destroyed = false;
@@ -54,43 +58,23 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
 
   function render(): void {
     submitButton = null;
-    container.replaceChildren(...(phase.name === 'done' ? [resultCard(phase.result)] : [hero(), form(), assurances()]));
+    byteCounter = null;
+    container.replaceChildren(
+      dom.h('div', { class: 'mb-4' }, statusBadge(dom, 'AES-256-GCM / Client-Side Encrypted')),
+      ...(phase.name === 'done' ? [resultView(phase.result)] : [intro(), form()]),
+    );
     if (pendingFocus !== null) {
       container.querySelector<HTMLElement>(pendingFocus)?.focus();
       pendingFocus = null;
     }
   }
 
-  function hero(): HTMLElement {
+  function intro(): HTMLElement {
     return dom.h(
-      'section',
-      { class: 'mb-8 text-center sm:mb-10' },
-      dom.h('h1', { class: ui.h1 }, '大切な情報を、一度だけ、安全に。'),
-      dom.h(
-        'p',
-        { class: cx(ui.lead, 'mx-auto mt-4 max-w-xl') },
-        '暗号化はあなたのブラウザの中で完結します。サーバーは内容も鍵も見られず、相手が開くと同時に完全に消滅します。',
-      ),
-    );
-  }
-
-  function assurances(): HTMLElement {
-    const items: Array<[IconName, string, string]> = [
-      ['shield-check', 'AES-256-GCM で暗号化', 'ブラウザ標準の Web Crypto API だけで実行します。'],
-      ['key', '鍵はサーバーに届かない', '復号鍵は共有リンクの # 以降にだけ含まれます。'],
-      ['clock', '開封と同時に消滅', '期限切れの未開封データも自動で削除されます。'],
-    ];
-    return dom.h(
-      'ul',
-      { class: 'mt-8 grid gap-5 sm:grid-cols-3' },
-      ...items.map(([icon, title, body]) =>
-        dom.h(
-          'li',
-          { class: 'flex gap-3 sm:flex-col' },
-          createIcon(dom, icon, 'size-6 text-accent'),
-          dom.h('div', {}, dom.h('p', { class: 'text-sm font-semibold text-fg' }, title), dom.h('p', { class: 'mt-0.5 text-sm text-muted' }, body)),
-        ),
-      ),
+      'div',
+      { class: 'mb-5 space-y-2' },
+      dom.h('h1', { class: ui.h1 }, '新規共有'),
+      dom.h('p', { class: ui.sub }, 'URL ハッシュ（#）の復号鍵はサーバーに送信されません。取得後、サーバー上のデータは物理削除されます。'),
     );
   }
 
@@ -102,9 +86,8 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
       variant: 'primary',
       type: 'submit',
       action: 'submit',
-      icon: busy ? 'spinner' : 'lock',
       busy,
-      label: busy ? '暗号化しています…' : '暗号化して共有リンクを生成',
+      label: busy ? '暗号化中…' : '暗号化リンクを生成',
       disabled: busy || !canSubmit(),
     });
 
@@ -112,31 +95,21 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
       'form',
       { class: ui.card, 'aria-busy': busy ? 'true' : 'false' },
       modeTabs(busy),
-      dom.h(
-        'div',
-        { role: 'tabpanel', id: 'panel', 'aria-labelledby': `tab-${state.mode}`, class: 'mt-6' },
-        state.mode === 'text' ? messageField(busy) : fileField(busy),
-      ),
+      dom.h('div', { role: 'tabpanel', id: 'panel', 'aria-labelledby': `tab-${state.mode}`, class: 'mt-4' }, state.mode === 'text' ? messageField(busy) : fileField(busy)),
       expiryField(busy),
       message !== null &&
         dom.h(
           'div',
-          { class: 'mt-6' },
+          { class: 'mt-5' },
           notice(dom, {
             tone: message.tone === 'danger' ? 'danger' : 'info',
-            icon: message.tone === 'danger' ? 'alert' : 'check',
+            ...(message.tone === 'danger' ? { icon: 'alert' as const } : {}),
             title: message.text,
             role: message.tone === 'danger' ? 'alert' : 'status',
             autofocus: true,
           }),
         ),
-      dom.h('div', { class: 'mt-6' }, submitButton),
-      dom.h(
-        'p',
-        { class: 'mt-4 flex items-start gap-2 text-sm text-muted' },
-        createIcon(dom, 'lock', 'mt-1 size-4'),
-        '鍵は共有リンクの # 以降にのみ含まれ、サーバーには送信されません。',
-      ),
+      dom.h('div', { class: 'mt-5' }, submitButton),
     );
     element.addEventListener('submit', (event) => {
       event.preventDefault();
@@ -146,7 +119,7 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
   }
 
   function modeTabs(disabled: boolean): HTMLElement {
-    const tab = (mode: Mode, label: string, icon: IconName): HTMLElement => {
+    const tab = (mode: Mode, label: string): HTMLElement => {
       const selected = state.mode === mode;
       return dom.h(
         'button',
@@ -164,16 +137,10 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
             keydown: (event) => onTabKeydown(event as KeyboardEvent),
           },
         },
-        createIcon(dom, icon, 'size-4'),
         label,
       );
     };
-    return dom.h(
-      'div',
-      { role: 'tablist', 'aria-label': '共有する内容の種類', class: 'grid grid-cols-2 gap-1 rounded-xl border border-line bg-sunken p-1' },
-      tab('text', 'メッセージ', 'message'),
-      tab('file', 'ファイル', 'file'),
-    );
+    return dom.h('div', { role: 'tablist', 'aria-label': '共有する内容の種類', class: ui.tabList }, tab('text', 'テキスト'), tab('file', 'ファイル'));
   }
 
   function onTabKeydown(event: KeyboardEvent): void {
@@ -201,31 +168,32 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
   function messageField(busy: boolean): HTMLElement {
     const textarea = dom.h('textarea', {
       id: 'message',
-      rows: 9,
+      rows: 10,
       autocomplete: 'off',
       // ブラウザの綴りチェックは、入力内容を外部サービスへ送る実装がある。機密を扱う入力欄では無効にする。
       spellcheck: 'false',
-      placeholder: 'パスワードや契約内容など、共有したい内容を入力してください',
-      'aria-describedby': 'message-hint',
+      placeholder: '共有するテキストを入力',
       disabled: busy,
       value: state.text,
-      class: ui.textarea,
+      class: ui.editor,
     });
+    byteCounter = dom.h('span', { 'data-testid': 'byte-count', class: cx('font-mono', state.textBytes > MAX_UPLOAD_BYTES ? 'text-red-400' : 'text-zinc-400') }, describeBytes(state.textBytes));
     textarea.addEventListener('input', () => {
       state.text = textarea.value;
-      updateSubmit();
+      state.textBytes = new TextEncoder().encode(state.text).byteLength;
+      refreshEditorState();
     });
     return dom.h(
       'div',
       {},
-      dom.h('label', { for: 'message', class: ui.label }, 'メッセージ'),
+      dom.h('label', { for: 'message', class: 'sr-only' }, '共有するテキスト'),
       textarea,
-      dom.h('p', { id: 'message-hint', class: ui.hint }, `そのまま貼り付けられます。最大 ${formatBytes(MAX_UPLOAD_BYTES)}。`),
+      dom.h('div', { class: cx('mt-1.5 flex items-center justify-between', ui.mutedMono) }, dom.h('span', {}, 'UTF-8'), byteCounter),
     );
   }
 
   function fileField(busy: boolean): HTMLElement {
-    const input = dom.h('input', { type: 'file', id: 'file', class: 'sr-only', 'aria-describedby': 'file-hint', disabled: busy });
+    const input = dom.h('input', { type: 'file', id: 'file', class: 'sr-only', disabled: busy });
     input.addEventListener('change', () => {
       const file = input.files?.[0] ?? null;
       input.value = ''; // 同じファイルを選び直しても change が発火するように
@@ -239,32 +207,31 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
       input,
       file === null
         ? [
-            createIcon(dom, 'upload', 'size-8 text-accent'),
-            dom.h('span', { class: 'text-base font-semibold text-fg' }, 'ここにファイルをドラッグ＆ドロップ'),
-            dom.h('span', { class: 'text-sm text-muted' }, 'またはクリックして選択'),
+            dom.h('span', { class: 'text-sm text-zinc-200' }, 'ファイルをドロップ、またはクリックして選択'),
+            dom.h('span', { class: ui.mutedMono }, `最大 ${formatBytes(MAX_UPLOAD_BYTES)} · ファイル名も暗号化`),
           ]
         : [
-            createIcon(dom, 'file', 'size-8 text-accent'),
-            dom.h('span', { class: 'max-w-full truncate text-base font-semibold text-fg', 'data-testid': 'selected-file-name' }, file.name),
-            dom.h('span', { class: 'text-sm text-muted' }, `${formatBytes(file.size)} ・ クリックまたはドロップで変更`),
+            dom.h('span', { class: 'max-w-full truncate font-mono text-sm text-zinc-100', 'data-testid': 'selected-file-name' }, file.name),
+            dom.h('span', { class: ui.mutedMono }, `${formatBytes(file.size)} · クリックまたはドロップで変更`),
           ],
     );
 
-    const highlight = (on: boolean): void => {
+    const setDragging = (on: boolean): void => {
       for (const name of ui.dropzoneActive.split(' ')) zone.classList.toggle(name, on);
+      zone.classList.toggle(ui.dropzoneIdleBorder, !on);
     };
     zone.addEventListener('dragenter', (event) => {
       event.preventDefault();
-      if (!busy) highlight(true);
+      if (!busy) setDragging(true);
     });
     zone.addEventListener('dragover', (event) => {
       event.preventDefault(); // drop を受け付けるために必須
-      if (!busy) highlight(true);
+      if (!busy) setDragging(true);
     });
-    zone.addEventListener('dragleave', () => highlight(false));
+    zone.addEventListener('dragleave', () => setDragging(false));
     zone.addEventListener('drop', (event) => {
       event.preventDefault();
-      highlight(false);
+      setDragging(false);
       if (busy) return;
       const files = (event as Event & { dataTransfer?: { files?: ArrayLike<File> } | null }).dataTransfer?.files;
       const first = files?.[0];
@@ -274,116 +241,118 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
     return dom.h(
       'div',
       {},
-      dom.h('span', { class: ui.label }, 'ファイル'),
+      dom.h('span', { class: 'sr-only' }, 'ファイル'),
       zone,
-      dom.h('p', { id: 'file-hint', class: ui.hint }, `1 つのファイルを送れます。最大 ${formatBytes(MAX_UPLOAD_BYTES)}。ファイル名も暗号化されます。`),
       file !== null &&
-        dom.h(
-          'div',
-          { class: 'mt-3' },
-          button(dom, { variant: 'secondary', icon: 'x', label: '選択を解除', action: 'remove-file', disabled: busy, on: { click: removeFile } }),
-        ),
+        dom.h('div', { class: 'mt-3' }, button(dom, { variant: 'secondary', label: '選択を解除', action: 'remove-file', disabled: busy, on: { click: removeFile } })),
     );
   }
 
   function expiryField(busy: boolean): HTMLElement {
-    const options = TTL_OPTIONS.map(({ seconds, label }) => {
-      const radio = dom.h('input', {
-        type: 'radio',
-        name: 'ttl',
-        value: String(seconds),
-        checked: state.ttlSeconds === seconds,
-        disabled: busy,
-        class: 'sr-only',
-      });
-      radio.addEventListener('change', () => {
-        state.ttlSeconds = seconds;
-      });
-      return dom.h('label', { class: ui.radioCard }, radio, dom.h('span', {}, label));
+    const select = dom.h(
+      'select',
+      { id: 'ttl', name: 'ttl', disabled: busy, class: ui.select },
+      ...TTL_OPTIONS.map(({ seconds, label }) => dom.h('option', { value: String(seconds), selected: state.ttlSeconds === seconds }, label)),
+    );
+    select.addEventListener('change', () => {
+      state.ttlSeconds = Number(select.value);
     });
     return dom.h(
-      'fieldset',
-      { class: 'mt-6' },
-      dom.h('legend', { class: ui.label }, '有効期限'),
-      dom.h('div', { class: 'grid grid-cols-3 gap-2' }, ...options),
-      dom.h('p', { class: ui.hint }, '期限を過ぎると、未開封でもサーバーから自動的に削除されます。'),
+      'div',
+      { class: 'mt-5' },
+      dom.h('div', { class: 'flex items-center justify-between gap-4' }, dom.h('label', { for: 'ttl', class: 'text-sm font-medium text-zinc-200' }, '有効期限'), select),
+      dom.h('p', { class: 'mt-1.5 text-xs text-zinc-400' }, '期限を過ぎたデータは、未取得でも自動的に削除されます。'),
     );
   }
 
-  function resultCard(result: Result): HTMLElement {
-    // 1 行の入力欄だと長いリンクの後半（鍵の部分）が見えなくなる。折り返して全文を見せる（読み取り専用の textarea）。
-    const input = dom.h('textarea', {
-      id: 'share-link',
-      readonly: true,
-      rows: 3,
-      spellcheck: 'false',
-      autocomplete: 'off',
-      value: result.url,
-      class: 'block w-full resize-none rounded-xl border border-line-strong bg-sunken px-3 py-3 font-mono text-sm leading-relaxed text-fg [overflow-wrap:anywhere] focus:border-accent',
-    });
-    input.addEventListener('focus', () => input.select());
+  function resultView(result: Result): HTMLElement {
+    // 鍵（# 以降）を、それ以外の部分と視覚的に区別する。
+    const hashAt = result.url.indexOf('#');
+    const linkBlock = dom.h(
+      'div',
+      {
+        id: 'share-link',
+        role: 'group',
+        'aria-labelledby': 'share-link-label',
+        'data-testid': 'share-link',
+        tabindex: 0,
+        class: cx(ui.codeBlock, 'select-all'),
+      },
+      dom.h('span', { class: 'text-zinc-400' }, result.url.slice(0, hashAt)),
+      dom.h('span', { 'data-testid': 'key-part', class: 'rounded-sm bg-emerald-500/10 text-emerald-400' }, result.url.slice(hashAt)),
+    );
 
-    const status = dom.h('p', { role: 'status', 'aria-live': 'polite', class: 'mt-2 min-h-6 text-sm text-ok' });
+    const status = dom.h('p', { role: 'status', 'aria-live': 'polite', class: STATUS_OK });
     const copyButton: HTMLButtonElement = button(dom, {
       variant: 'primary',
-      icon: 'copy',
       label: COPY_LABEL,
       action: 'copy',
-      on: { click: () => void copyLink(input, copyButton, status) },
+      on: { click: () => void copyLink(result.url, linkBlock, copyButton, status) },
     });
 
     const remaining = result.expiresAt.getTime() - env.now();
-    const row = (label: string, value: string): HTMLElement =>
-      dom.h('div', { class: ui.row }, dom.h('dt', { class: 'text-sm text-muted' }, label), dom.h('dd', { class: 'min-w-0 text-right text-sm font-medium text-fg [overflow-wrap:anywhere]' }, value));
+    const row = (label: string, value: string, sub?: string): HTMLElement =>
+      dom.h('div', { class: ui.row }, dom.h('dt', { class: ui.rowLabel }, label), dom.h('dd', { class: ui.rowValue }, value, sub !== undefined && dom.h('span', { class: ui.rowSub }, sub)));
 
     return dom.h(
       'section',
-      { class: ui.card },
+      { class: cx(ui.card, 'space-y-5') },
       dom.h(
         'div',
-        { class: 'flex items-center gap-3' },
-        dom.h('span', { class: 'grid size-10 shrink-0 place-items-center rounded-full bg-ok-bg text-ok ring-1 ring-ok-line' }, createIcon(dom, 'check', 'size-5')),
-        dom.h('h2', { class: ui.h2, tabindex: -1, 'data-autofocus': 'true' }, '共有リンクを生成しました'),
+        { class: 'flex items-center gap-2' },
+        createIcon(dom, 'check', 'size-4 text-emerald-500'),
+        dom.h('h1', { class: ui.h1, tabindex: -1, 'data-autofocus': 'true' }, '共有リンクを生成しました'),
       ),
-      dom.h('p', { class: 'mt-3 text-muted' }, '下のリンクを相手に送ってください。相手がリンクを開いて「データを開く」を押すと、内容が表示されます。'),
       dom.h(
         'div',
-        { class: 'mt-6' },
-        dom.h('label', { for: 'share-link', class: ui.label }, '共有リンク'),
-        input,
-        dom.h('div', { class: 'mt-3' }, copyButton),
-        status,
+        {},
+        dom.h('p', { id: 'share-link-label', class: ui.label }, '共有リンク'),
+        linkBlock,
+        dom.h(
+          'p',
+          { class: 'mt-2 text-xs leading-relaxed text-zinc-400' },
+          dom.h('span', { class: 'font-mono text-emerald-400' }, '#'),
+          ' 以降は復号鍵です。この鍵はサーバーを経由していません（ブラウザは # 以降を HTTP リクエストに含めません）。',
+        ),
       ),
+      dom.h('div', {}, copyButton, status),
       dom.h(
         'dl',
-        { class: 'mt-2 mb-6' },
-        row('有効期限', `${formatDateTime(result.expiresAt)}（あと ${formatRemaining(remaining)}）`),
-        row('内容', result.type === 'file' ? `ファイル: ${result.fileName ?? ''}（${formatBytes(result.size)}）` : 'メッセージ'),
+        {},
+        row('有効期限', formatDateTime(result.expiresAt), `あと ${formatRemaining(remaining)}`),
+        row('内容', result.type === 'file' ? `ファイル · ${result.fileName ?? ''} · ${formatBytes(result.size)}` : `テキスト · ${formatBytes(result.size)}`),
       ),
-      notice(
-        dom,
-        { tone: 'warn', icon: 'alert', title: 'このリンクは再表示できません' },
-        dom.h('p', {}, '復号鍵はこのブラウザの中にしか存在せず、サーバーには保存されません。この画面を閉じる前に、必ずリンクをコピーして相手に共有してください。'),
-      ),
-      dom.h('div', { class: 'mt-6' }, button(dom, { variant: 'secondary', icon: 'upload', label: '新しく作成する', action: 'reset', on: { click: reset } })),
+      notice(dom, { tone: 'warn', icon: 'alert', title: 'このリンクは再表示できません' }, dom.h('p', {}, '復号鍵はこのブラウザ内にのみ存在します。画面を閉じる前にコピーしてください。')),
+      dom.h('div', {}, button(dom, { variant: 'secondary', label: '新規共有', action: 'reset', on: { click: reset } })),
     );
   }
 
   // ---- 操作 -------------------------------------------------------------------------------
 
-  function canSubmit(): boolean {
-    if (phase.name === 'encrypting') return false;
-    return state.mode === 'text' ? state.text.trim() !== '' : state.file !== null;
+  function describeBytes(bytes: number): string {
+    return `${formatBytes(bytes)} / ${formatBytes(MAX_UPLOAD_BYTES)}${bytes > MAX_UPLOAD_BYTES ? ' 上限超過' : ''}`;
   }
 
-  function updateSubmit(): void {
+  function canSubmit(): boolean {
+    if (phase.name === 'encrypting') return false;
+    return state.mode === 'text' ? state.text.trim() !== '' && state.textBytes <= MAX_UPLOAD_BYTES : state.file !== null;
+  }
+
+  /** 入力のたびに、バイト数の表示と送信ボタンの有効/無効だけを更新する（フォーム全体は再描画しない）。 */
+  function refreshEditorState(): void {
+    const over = state.textBytes > MAX_UPLOAD_BYTES;
+    if (byteCounter !== null) {
+      byteCounter.textContent = describeBytes(state.textBytes);
+      byteCounter.classList.toggle('text-red-400', over);
+      byteCounter.classList.toggle('text-zinc-400', !over);
+    }
     if (submitButton !== null) submitButton.disabled = !canSubmit();
   }
 
   function selectFile(file: File, droppedMultiple = false): void {
     if (file.size === 0) return showFormMessage({ tone: 'danger', text: 'このファイルは空のため送信できません。' });
     if (file.size > MAX_UPLOAD_BYTES) {
-      return showFormMessage({ tone: 'danger', text: `ファイルが大きすぎます（最大 ${formatBytes(MAX_UPLOAD_BYTES)}）。` });
+      return showFormMessage({ tone: 'danger', text: `ファイルが上限（${formatBytes(MAX_UPLOAD_BYTES)}）を超えています。` });
     }
 
     state.file = file;
@@ -430,7 +399,7 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
 
       if (source.kind === 'text') {
         size = new TextEncoder().encode(source.text).byteLength;
-        if (size > MAX_UPLOAD_BYTES) throw new UserFacingError(`メッセージが大きすぎます（最大 ${formatBytes(MAX_UPLOAD_BYTES)}）。`);
+        if (size > MAX_UPLOAD_BYTES) throw new UserFacingError(`テキストが上限（${formatBytes(MAX_UPLOAD_BYTES)}）を超えています。`);
         encrypted = await encryptData(source.text);
         type = 'text';
       } else {
@@ -466,18 +435,28 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
     render();
   }
 
-  async function copyLink(input: HTMLTextAreaElement, copyButton: HTMLButtonElement, status: HTMLElement): Promise<void> {
+  /** リンク全体を選択状態にする（クリップボードが使えないとき、Ctrl+C でコピーできるように）。 */
+  function selectContents(node: Node): void {
+    const selection = env.doc.getSelection();
+    if (selection === null) return;
+    const range = env.doc.createRange();
+    range.selectNodeContents(node);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  async function copyLink(url: string, linkBlock: HTMLElement, copyButton: HTMLButtonElement, status: HTMLElement): Promise<void> {
     const label = copyButton.querySelector('[data-label]');
     try {
       if (env.clipboard === null) throw new Error('clipboard unavailable');
-      await env.clipboard.writeText(input.value);
-      status.className = 'mt-2 min-h-6 text-sm text-ok';
+      await env.clipboard.writeText(url);
+      status.className = STATUS_OK;
       status.textContent = 'リンクをコピーしました。';
       if (label !== null) label.textContent = 'コピーしました';
     } catch {
-      input.focus();
-      input.select();
-      status.className = 'mt-2 min-h-6 text-sm text-danger';
+      linkBlock.focus();
+      selectContents(linkBlock);
+      status.className = STATUS_FAILED;
       status.textContent = 'コピーできませんでした。リンクを選択したので、Ctrl+C（Mac は ⌘+C）でコピーしてください。';
     }
 
@@ -491,6 +470,7 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
 
   function reset(): void {
     state.text = '';
+    state.textBytes = 0;
     state.file = null;
     state.mode = 'text';
     phase = { name: 'editing', message: null };
@@ -516,17 +496,17 @@ function describeSendError(error: unknown): string {
   if (error instanceof ApiError) {
     switch (error.code) {
       case 'payload_too_large':
-        return `データが大きすぎます（最大 ${formatBytes(MAX_UPLOAD_BYTES)}）。`;
+        return `サイズが上限（${formatBytes(MAX_UPLOAD_BYTES)}）を超えています。`;
       case 'storage_full':
-        return 'サーバーの保存領域が一時的に一杯です。しばらくしてから、もう一度お試しください。';
+        return 'サーバーの保存領域が上限に達しています。時間をおいて再実行してください。';
       case 'network':
-        return 'サーバーに接続できませんでした。ネットワークを確認して、もう一度お試しください。';
+        return 'サーバーに接続できません。ネットワークを確認して再実行してください。';
       default:
-        return 'サーバーとの通信でエラーが発生しました。しばらくしてから、もう一度お試しください。';
+        return 'サーバーとの通信でエラーが発生しました。時間をおいて再実行してください。';
     }
   }
   if (error instanceof CipherDropCryptoError && error.code === 'WEBCRYPTO_UNAVAILABLE') {
-    return 'このブラウザ環境では暗号化を実行できません。HTTPS（または localhost）で接続していることを確認してください。';
+    return 'この環境では暗号化を実行できません。HTTPS（または localhost）で接続してください。';
   }
-  return '予期しないエラーが発生しました。もう一度お試しください。';
+  return '予期しないエラーが発生しました。再実行してください。';
 }

@@ -1,5 +1,4 @@
 import type { ApiClient } from './api.ts';
-import type { ThemeStorage } from './theme.ts';
 
 /**
  * 画面が外の世界に触れるための窓口。
@@ -17,8 +16,6 @@ export interface AppEnv {
   api: ApiClient;
   /** 復号したファイルをダウンロードとして保存する（download.ts の saveFile）。 */
   saveFile(name: string, data: ArrayBuffer): void;
-  storage: ThemeStorage | null;
-  prefersDark(): boolean;
   now(): number;
   setTimeout(handler: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;

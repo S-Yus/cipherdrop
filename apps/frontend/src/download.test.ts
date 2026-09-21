@@ -33,7 +33,7 @@ function setup(options: { objectUrl?: string } = {}) {
 describe('saveFile', () => {
   it('無害化した名前で、非表示のリンクをクリックしてダウンロードし、終わったらリンクを取り除く', () => {
     const { window, env, anchors, revoked } = setup();
-    saveFile(env, '../../evil‮fdp.exe', new Uint8Array([1, 2, 3]).buffer);
+    saveFile(env, '../../evil\u202Efdp.exe', new Uint8Array([1, 2, 3]).buffer);
 
     assert.equal(anchors.length, 1);
     const [anchor] = anchors;

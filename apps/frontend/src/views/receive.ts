@@ -1,8 +1,8 @@
 /**
  * 受取・復号画面（/v/:id#key）。2 段階で取得する。
  *
- *   Stage 1 確認  ページ読み込み時に GET …/meta を呼ぶ。何も消費しない。「開くと消滅する」警告を出して待つ。
- *   Stage 2 消費  受信者が「開く」ボタンを押したときだけ POST …/consume を呼ぶ。復号して表示（またはダウンロード）する。
+ *   Stage 1 確認  ページ読み込み時に GET …/meta を呼ぶ。何も消費しない。「開くと削除される」ことを示して待つ。
+ *   Stage 2 消費  受信者が実行ボタンを押したときだけ POST …/consume を呼ぶ。復号して表示（またはダウンロード）する。
  *
  * これにより、リンクプレビュー・クローラー・セキュリティスキャナがこのページを開いても、データは消えない。
  * 復号後のテキストは renderTextSafely（テキストノード）でだけ描画し、HTML としては一切解釈しない。
@@ -16,7 +16,6 @@ import type { Children } from '../dom.ts';
 import type { AppEnv, ViewHandle } from '../env.ts';
 import { FALLBACK_FILE_NAME, hasRiskyExtension, sanitizeFileName } from '../file-name.ts';
 import { formatBytes, formatDateTime, formatRemaining } from '../format.ts';
-import { createIcon } from '../icons.ts';
 import { button, notice, ui } from '../ui.ts';
 
 type Phase =
@@ -29,7 +28,8 @@ type Phase =
   | { name: 'open-error'; meta: PayloadMeta }
   | { name: 'decrypt-failed' }
   | { name: 'text'; text: string }
-  | { name: 'file'; fileName: string; size: number; data: ArrayBuffer; risky: boolean; saveFailed: boolean };
+  | { name: 'file'; fileName: string; size: number; data: ArrayBuffer; risky: boolean; saveFailed: boolean }
+  | { name: 'discarded' };
 
 const COPY_FEEDBACK_MS = 2_500;
 
@@ -47,7 +47,7 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
   // ---- 描画 -------------------------------------------------------------------------------
 
   function render(): void {
-    container.replaceChildren(card(), dom.h('p', { class: 'mt-6 text-center' }, dom.h('a', { href: '/', class: 'text-sm font-semibold text-accent underline underline-offset-4' }, 'CipherDrop で新しく共有する')));
+    container.replaceChildren(card());
     if (pendingFocus !== null) {
       container.querySelector<HTMLElement>(pendingFocus)?.focus();
       pendingFocus = null;
@@ -55,46 +55,42 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
   }
 
   function heading(text: string): HTMLElement {
-    return dom.h('h2', { class: ui.h2, tabindex: -1, 'data-autofocus': 'true' }, text);
+    return dom.h('h1', { class: ui.h1, tabindex: -1, 'data-autofocus': 'true' }, text);
   }
 
   function section(...children: Children): HTMLElement {
-    return dom.h('section', { class: cx(ui.card, 'space-y-6') }, ...children);
+    return dom.h('section', { class: cx(ui.card, 'space-y-5') }, ...children);
   }
 
   function card(): HTMLElement {
     switch (phase.name) {
       case 'loading':
-        return loadingCard();
+        return section(dom.h('p', { role: 'status', class: ui.mutedMono }, '確認中…'));
       case 'invalid-link':
-        return messageCard('danger', 'リンクが正しくありません', [
-          '共有リンクの後半（鍵の部分）が欠けているか、余分な文字が含まれています。メールやチャットでの折り返し・句読点の付加が原因のことがあります。',
-          '送信者にリンクの再送を依頼してください。このリンクではデータを開いていないため、正しいリンクがあれば開けます。',
+        return messageCard('danger', 'リンクが不正です', [
+          '復号鍵（# 以降）が欠落しているか、形式が不正です。取得は実行されていません。',
+          '送信者にリンクの再送を依頼してください。',
         ]);
       case 'unavailable':
-        return messageCard('warn', 'このリンクは無効です', [
-          'すでに開封された、有効期限が切れた、またはリンクが正しくない可能性があります。',
-          'データは一度開くとサーバーから削除されます。送信者に新しいリンクの発行を依頼してください。',
-        ]);
+        return messageCard('warn', 'データが存在しません', ['取得済み、有効期限切れ、またはリンクの誤りです。']);
       case 'load-error':
-        return messageCard('danger', 'サーバーに接続できませんでした', ['ネットワークを確認して、もう一度お試しください。'], {
-          label: 'もう一度確認する',
+        return messageCard('danger', 'サーバーに接続できません', ['ネットワークを確認して再実行してください。'], {
+          label: '再試行',
           action: 'retry',
           onClick: () => void load(),
         });
       case 'open-error': {
         const { meta } = phase;
-        return messageCard(
-          'danger',
-          'データを取得できませんでした',
-          ['通信に失敗しました。通信の途中で切断された場合、データはすでに消滅している可能性があります。'],
-          { label: 'もう一度試す', action: 'retry-open', onClick: () => void open(meta) },
-        );
+        return messageCard('danger', '取得に失敗しました', ['通信の途中で切断された場合、データは既に削除されている可能性があります。'], {
+          label: '再試行',
+          action: 'retry-open',
+          onClick: () => void open(meta),
+        });
       }
       case 'decrypt-failed':
-        return messageCard('danger', 'データを復号できませんでした', [
-          'データは取得されましたが、復号に失敗しました。リンクの鍵が正しくないか、データが改ざんされた可能性があります。',
-          'このデータはすでにサーバーから削除されています。送信者に再送を依頼してください。',
+        return messageCard('danger', '復号に失敗しました', [
+          '鍵が一致しないか、データが改ざんされています。サーバー上のデータは削除済みです。',
+          '送信者に再送を依頼してください。',
         ]);
       case 'confirm':
       case 'opening':
@@ -103,14 +99,12 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
         return textCard(phase.text);
       case 'file':
         return fileCard(phase);
+      case 'discarded':
+        return section(
+          heading('破棄しました'),
+          dom.h('p', { class: ui.sub }, '表示していたデータを画面から消去しました。サーバー上のデータは削除済みのため、再表示できません。'),
+        );
     }
-  }
-
-  function loadingCard(): HTMLElement {
-    const bar = (width: string): HTMLElement => dom.h('div', { class: cx('h-5 rounded-md bg-sunken motion-safe:animate-pulse', width) });
-    return section(
-      dom.h('div', { role: 'status', class: 'space-y-4' }, dom.h('span', { class: 'sr-only' }, '共有データを確認しています…'), bar('w-1/3'), bar('w-2/3'), bar('w-full'), bar('w-5/6')),
-    );
   }
 
   function messageCard(
@@ -121,51 +115,39 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
   ): HTMLElement {
     return section(
       notice(dom, { tone, icon: 'alert', title, role: 'alert', autofocus: true }, ...paragraphs.map((text) => dom.h('p', {}, text))),
-      action &&
-        button(dom, { variant: 'secondary', label: action.label, action: action.action, on: { click: action.onClick } }),
+      action && dom.h('div', {}, button(dom, { variant: 'secondary', label: action.label, action: action.action, on: { click: action.onClick } })),
     );
   }
 
-  /** Stage 1: 確認。警告を出し、受信者が押すまで何も消費しない。 */
+  /** Stage 1: 確認。削除されることを事実として示し、受信者が実行するまで何も消費しない。 */
   function confirmCard(meta: PayloadMeta, opening: boolean): HTMLElement {
     const isFile = meta.type === 'file';
+    const actionLabel = isFile ? 'データを復号してダウンロード' : 'データを復号して表示';
     const remaining = meta.expiresAt.getTime() - env.now();
-    const row = (label: string, value: string): HTMLElement =>
-      dom.h('div', { class: ui.row }, dom.h('dt', { class: 'text-sm text-muted' }, label), dom.h('dd', { class: 'text-right text-sm font-medium text-fg' }, value));
+    const row = (label: string, value: string, sub?: string): HTMLElement =>
+      dom.h('div', { class: ui.row }, dom.h('dt', { class: ui.rowLabel }, label), dom.h('dd', { class: ui.rowValue }, value, sub !== undefined && dom.h('span', { class: ui.rowSub }, sub)));
 
     return section(
-      dom.h(
-        'div',
-        { class: 'space-y-2' },
-        dom.h('p', { class: 'text-sm font-semibold text-accent' }, '共有されたデータが届いています'),
-        // サーバーの種別ヒントは表示だけに使う（実際の種別は復号後に確定する）。
-        dom.h('h2', { class: ui.h2, tabindex: -1, 'data-autofocus': 'true' }, isFile ? 'ファイルを受け取る' : 'メッセージを受け取る'),
-      ),
+      // サーバーの種別ヒントは表示だけに使う（実際の種別は復号後に確定する）。
+      heading('受信データ'),
       dom.h(
         'dl',
         {},
-        row('種類', isFile ? 'ファイル' : 'テキストメッセージ'),
+        row('種類', isFile ? 'ファイル' : 'テキスト'),
         row('サイズ', formatBytes(meta.size)),
-        row('有効期限', `${formatDateTime(meta.expiresAt)}（あと ${formatRemaining(remaining)}）`),
+        row('有効期限', formatDateTime(meta.expiresAt), `あと ${formatRemaining(remaining)}`),
+        row('暗号方式', 'AES-256-GCM'),
       ),
       notice(
         dom,
-        { tone: 'warn', icon: 'alert', title: 'このデータは一度開くとサーバーから永久に消滅します' },
-        dom.h('p', {}, `「${isFile ? 'ファイルをダウンロード' : 'データを開く'}」を押した瞬間に、サーバー上のデータは完全に削除され、二度と取得できません。`),
-        dom.h(
-          'ul',
-          { class: 'list-disc space-y-1 pl-5' },
-          dom.h('li', {}, '開いた内容は、この画面にだけ表示されます。'),
-          dom.h('li', {}, '同じリンクを他の人に送っても、開けるのは最初の 1 回だけです。'),
-          dom.h('li', {}, 'プレビューしただけでは消えません。準備ができてから押してください。'),
-        ),
+        { tone: 'warn', icon: 'alert', title: 'このデータは一度開くとサーバーから永久削除されます' },
+        dom.h('p', {}, `「${actionLabel}」を実行した時点で削除されます。`),
       ),
       button(dom, {
         variant: 'primary',
         action: 'open',
-        icon: opening ? 'spinner' : isFile ? 'download' : 'key',
         busy: opening,
-        label: opening ? '取得して復号しています…' : isFile ? 'ファイルをダウンロード' : 'データを開く',
+        label: opening ? '取得・復号中…' : actionLabel,
         disabled: opening,
         on: { click: () => void open(meta) },
       }),
@@ -176,64 +158,64 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
   function textCard(text: string): HTMLElement {
     const output = dom.h('pre', {
       role: 'region',
-      'aria-label': 'メッセージの内容',
+      'aria-label': '復号結果',
       tabindex: 0,
       'data-testid': 'decrypted-text',
-      class: 'max-h-[60vh] overflow-auto rounded-xl border border-line-strong bg-sunken p-4 font-sans text-base leading-relaxed text-fg whitespace-pre-wrap [overflow-wrap:anywhere]',
+      class: cx(ui.codeBlock, 'max-h-[60vh] overflow-auto whitespace-pre-wrap'),
     });
     renderTextSafely(output, text);
 
     const copyButton: HTMLButtonElement = button(dom, {
       variant: 'secondary',
-      icon: 'copy',
-      label: 'テキストをコピー',
+      label: 'コピー',
       action: 'copy-text',
       on: { click: () => void copyText(text, copyButton) },
     });
 
     return section(
-      dom.h('div', { class: 'flex items-center gap-3' }, createIcon(dom, 'check', 'size-6 text-ok'), heading('メッセージを受け取りました')),
+      dom.h(
+        'div',
+        { class: 'flex items-baseline justify-between gap-4' },
+        heading('復号結果'),
+        dom.h('span', { 'data-testid': 'decrypted-size', class: ui.mutedMono }, `テキスト · ${formatBytes(new TextEncoder().encode(text).byteLength)}`),
+      ),
       output,
-      dom.h('div', {}, copyButton),
-      deletedNotice(),
+      dom.h('div', { class: 'flex gap-2' }, copyButton, discardButton()),
+      dom.h('p', { class: 'text-xs text-zinc-400' }, 'サーバー上のデータは削除済みです。破棄すると再表示できません。'),
     );
   }
 
   /** Stage 2 の結果（ファイル）。ダウンロードするだけで、アプリの画面内では開かない。 */
   function fileCard(file: Extract<Phase, { name: 'file' }>): HTMLElement {
     return section(
-      dom.h('div', { class: 'flex items-center gap-3' }, createIcon(dom, 'check', 'size-6 text-ok'), heading('ファイルを受け取りました')),
       dom.h(
         'div',
-        { class: 'flex items-center gap-4 rounded-xl border border-line-strong bg-sunken p-4' },
-        createIcon(dom, 'file', 'size-8 text-accent'),
-        dom.h(
-          'div',
-          { class: 'min-w-0' },
-          dom.h('p', { class: 'font-semibold text-fg [overflow-wrap:anywhere]', 'data-testid': 'received-file-name' }, file.fileName),
-          dom.h('p', { class: 'text-sm text-muted' }, formatBytes(file.size)),
-        ),
+        { class: 'flex items-baseline justify-between gap-4' },
+        heading('復号完了'),
+        dom.h('span', { class: ui.mutedMono }, `ファイル · ${formatBytes(file.size)}`),
       ),
+      dom.h('div', { class: ui.codeBlock, 'data-testid': 'received-file-name' }, file.fileName),
       file.saveFailed
-        ? notice(dom, { tone: 'warn', icon: 'alert', title: '自動でダウンロードできませんでした', role: 'alert' }, dom.h('p', {}, '下のボタンで保存してください。'))
-        : dom.h('p', { role: 'status', class: 'text-sm text-ok' }, 'ダウンロードを開始しました。'),
+        ? notice(dom, { tone: 'warn', icon: 'alert', title: '自動でダウンロードできませんでした', role: 'alert' }, dom.h('p', {}, '「再ダウンロード」で保存してください。'))
+        : dom.h('p', { role: 'status', class: 'text-sm text-emerald-400' }, 'ダウンロードを開始しました。'),
       file.risky &&
         notice(
           dom,
-          { tone: 'warn', icon: 'alert', title: '実行ファイルやスクリプトの可能性があります' },
-          dom.h('p', {}, '送信元が信頼できる場合にのみ開いてください。心当たりのないファイルは開かずに削除してください。'),
+          { tone: 'warn', icon: 'alert', title: '実行ファイルまたはスクリプトの可能性があります' },
+          dom.h('p', {}, '信頼できる送信元のファイルのみ開いてください。'),
         ),
-      dom.h('div', {}, button(dom, { variant: 'secondary', icon: 'download', label: 'もう一度ダウンロード', action: 'download-again', on: { click: () => saveAgain(file) } })),
-      deletedNotice(),
+      dom.h(
+        'div',
+        { class: 'flex gap-2' },
+        button(dom, { variant: 'secondary', label: '再ダウンロード', action: 'download-again', on: { click: () => saveAgain(file) } }),
+        discardButton(),
+      ),
+      dom.h('p', { class: 'text-xs text-zinc-400' }, 'サーバー上のデータは削除済みです。破棄すると再ダウンロードできません。'),
     );
   }
 
-  function deletedNotice(): HTMLElement {
-    return notice(
-      dom,
-      { tone: 'info', icon: 'shield-check', title: 'このデータはサーバーから削除されました' },
-      dom.h('p', {}, 'この画面を閉じると、もう一度開くことはできません。必要な内容は今のうちに控えてください。'),
-    );
+  function discardButton(): HTMLButtonElement {
+    return button(dom, { variant: 'secondary', label: '破棄', action: 'discard', on: { click: discard } });
   }
 
   // ---- 操作 -------------------------------------------------------------------------------
@@ -301,6 +283,15 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
     return { name: 'file', fileName, size: payload.data.byteLength, data: payload.data, risky: hasRiskyExtension(fileName), saveFailed };
   }
 
+  /** 表示中のデータ（復号したテキスト・ファイルのバイト列）を、この画面から消去する。参照を手放すので再表示はできない。 */
+  function discard(): void {
+    if (feedbackTimer !== null) env.clearTimeout(feedbackTimer);
+    feedbackTimer = null;
+    phase = { name: 'discarded' };
+    pendingFocus = '[data-autofocus]';
+    render();
+  }
+
   function saveAgain(file: Extract<Phase, { name: 'file' }>): void {
     try {
       env.saveFile(file.fileName, file.data);
@@ -316,11 +307,11 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
       await env.clipboard.writeText(text);
       if (label !== null) label.textContent = 'コピーしました';
     } catch {
-      if (label !== null) label.textContent = 'コピーできませんでした（手動で選択してください）';
+      if (label !== null) label.textContent = 'コピーできません';
     }
     if (feedbackTimer !== null) env.clearTimeout(feedbackTimer);
     feedbackTimer = env.setTimeout(() => {
-      if (!destroyed && label !== null) label.textContent = 'テキストをコピー';
+      if (!destroyed && label !== null) label.textContent = 'コピー';
     }, COPY_FEEDBACK_MS);
   }
 

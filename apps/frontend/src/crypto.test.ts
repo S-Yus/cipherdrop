@@ -39,7 +39,7 @@ describe('encryptData / decryptData: 往復', () => {
     '',
     'hello',
     'こんにちは、CipherDrop 🔐 — 日本語・絵文字・結合文字 é',
-    '﻿先頭が BOM の文字列',
+    '\uFEFF先頭が BOM の文字列',
     'line1\nline2\r\nline3\t<tab>',
     '<script>alert(1)</script><img src=x onerror=alert(1)>',
     'a'.repeat(100_000),
@@ -269,8 +269,8 @@ describe('ファイル（名前つき）: encryptFile / decryptPayload', () => {
     '契約書_最終版（確定）.docx',
     'photo 😀.png',
     '../../etc/passwd',
-    'con.txt .exe',
-    '‮fdp.exe',
+    'con.txt\u0000.exe',
+    '\u202Efdp.exe',
     '',
     'x'.repeat(1024),
     'あ'.repeat(341), // 1023 バイト
@@ -452,7 +452,7 @@ describe('base64UrlEncode / base64UrlDecode', () => {
       'Z', // 長さ mod 4 == 1 は成立しない
       'Zh', // 余りビットが 0 でない（正規形は "Zg"）
       'Zm9', // 余りビットが 0 でない（正規形は "Zm8"）
-      'Zm9v ',
+      'Zm9v\u0000',
       'ｚｍ９ｖ', // 全角
     ];
     for (const input of invalid) {

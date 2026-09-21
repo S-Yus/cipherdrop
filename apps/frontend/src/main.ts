@@ -9,15 +9,6 @@ import { saveFile } from './download.ts';
 const root = document.getElementById('app');
 if (root === null) throw new Error('#app element not found');
 
-/** localStorage は、プライベートモード等で参照しただけで例外になることがある。 */
-function safeLocalStorage(): Storage | null {
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
-}
-
 mountApp({
   doc: document,
   root,
@@ -36,8 +27,6 @@ mountApp({
       name,
       data,
     ),
-  storage: safeLocalStorage(),
-  prefersDark: () => window.matchMedia('(prefers-color-scheme: dark)').matches,
   now: () => Date.now(),
   setTimeout: (handler, ms) => window.setTimeout(handler, ms),
   clearTimeout: (handle) => window.clearTimeout(handle as number),

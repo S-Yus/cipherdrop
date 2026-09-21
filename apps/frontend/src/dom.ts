@@ -22,7 +22,7 @@ export interface Props {
 const ALLOWED_ATTRIBUTES = new Set([
   'class', 'id', 'type', 'name', 'value', 'placeholder', 'rows', 'disabled', 'readonly', 'checked', 'hidden',
   'role', 'tabindex', 'title', 'for', 'accept', 'autocomplete', 'spellcheck', 'maxlength', 'multiple', 'required',
-  'href', 'lang',
+  'selected', 'href', 'lang',
 ]);
 const ALLOWED_PATTERNS = [/^aria-[a-z]+$/, /^data-[a-z][a-z0-9-]*$/];
 
