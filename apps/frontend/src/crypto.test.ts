@@ -7,7 +7,10 @@ import {
   base64UrlDecode,
   base64UrlEncode,
   decryptData,
+  decryptPayload,
   encryptData,
+  encryptFile,
+  isValidKeyString,
   renderTextSafely,
 } from './crypto.ts';
 
@@ -248,6 +251,159 @@ describe('decryptData: 攻撃・誤用への耐性', () => {
         return true;
       });
     }
+  });
+});
+
+/** OpenSSL（node:crypto）で、任意の平文バイト列を AES-256-GCM で封印する（エンベロープ構造の独立検証・不正構造の作成用）。 */
+function sealWithOpenSsl(plaintext: Uint8Array) {
+  const key = randomBytes(32);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+  return { encrypted: toArrayBuffer(encrypted), iv: new Uint8Array(iv), keyString: key.toString('base64url') };
+}
+
+describe('ファイル（名前つき）: encryptFile / decryptPayload', () => {
+  const fileNames = [
+    'report.pdf',
+    '契約書_最終版（確定）.docx',
+    'photo 😀.png',
+    '../../etc/passwd',
+    'con.txt .exe',
+    '‮fdp.exe',
+    '',
+    'x'.repeat(1024),
+    'あ'.repeat(341), // 1023 バイト
+  ];
+
+  for (const name of fileNames) {
+    it(`名前とバイト列がそのまま往復する: ${JSON.stringify(name.slice(0, 24))}`, async () => {
+      const data = toArrayBuffer(randomBytes(300));
+      const { encryptedData, iv, keyString } = await encryptFile({ name, data });
+
+      const decrypted = await decryptPayload(encryptedData, iv, keyString);
+      assert.equal(decrypted.type, 'file');
+      assert.ok(decrypted.type === 'file');
+      assert.equal(decrypted.name, name);
+      assert.deepEqual(new Uint8Array(decrypted.data), new Uint8Array(data));
+    });
+  }
+
+  it('空のファイル・1MiB のファイルも往復し、暗号文サイズは 1 + 2 + 名前 + 本体 + 16 バイト', async () => {
+    for (const size of [0, 1024 * 1024]) {
+      const data = toArrayBuffer(randomBytes(size));
+      const { encryptedData, iv, keyString } = await encryptFile({ name: 'a.bin', data });
+      assert.equal(encryptedData.byteLength, 1 + 2 + 5 + size + 16);
+      const decrypted = await decryptPayload(encryptedData, iv, keyString);
+      assert.ok(decrypted.type === 'file');
+      assert.equal(decrypted.data.byteLength, size);
+    }
+  });
+
+  it('ファイル名は暗号文に平文で現れない（サーバーに名前は見えない）', async () => {
+    const name = '山田太郎_診断書.pdf';
+    const { encryptedData } = await encryptFile({ name, data: new ArrayBuffer(64) });
+    const bytes = Buffer.from(encryptedData);
+    for (const needle of [name, Buffer.from(name).toString('base64'), Buffer.from(name).toString('hex'), '診断書']) {
+      assert.equal(bytes.includes(needle), false);
+    }
+  });
+
+  it('名前が UTF-8 で 1024 バイトを超えると INVALID_PAYLOAD', async () => {
+    for (const name of ['x'.repeat(1025), 'あ'.repeat(342)]) {
+      await assertCryptoError(encryptFile({ name, data: new ArrayBuffer(1) }), 'INVALID_PAYLOAD');
+    }
+  });
+
+  it('不正な入力（名前が文字列でない・本体が ArrayBuffer でない・null）は INVALID_PAYLOAD', async () => {
+    const invalid: unknown[] = [
+      { name: 1, data: new ArrayBuffer(1) },
+      { name: 'a', data: new Uint8Array(3) },
+      { name: 'a' },
+      null,
+      undefined,
+    ];
+    for (const input of invalid) {
+      await assertCryptoError(encryptFile(input as { name: string; data: ArrayBuffer }), 'INVALID_PAYLOAD');
+    }
+  });
+
+  it('OpenSSL で作った封筒（[0x03][u16 名前長][名前][本体]）を復号できる／encryptFile の出力を OpenSSL で解ける', async () => {
+    const name = Buffer.from('請求書.xlsx');
+    const data = randomBytes(40);
+    const lengthPrefix = Buffer.alloc(2);
+    lengthPrefix.writeUInt16BE(name.length);
+    const sealed = sealWithOpenSsl(Buffer.concat([Buffer.from([0x03]), lengthPrefix, name, data]));
+
+    const decrypted = await decryptPayload(sealed.encrypted, sealed.iv, sealed.keyString);
+    assert.ok(decrypted.type === 'file');
+    assert.equal(decrypted.name, '請求書.xlsx');
+    assert.deepEqual(new Uint8Array(decrypted.data), new Uint8Array(data));
+
+    // 逆方向: encryptFile の出力を OpenSSL で復号し、レイアウトを確認する
+    const mine = await encryptFile({ name: '請求書.xlsx', data: toArrayBuffer(data) });
+    const bytes = Buffer.from(mine.encryptedData);
+    const decipher = createDecipheriv('aes-256-gcm', Buffer.from(mine.keyString, 'base64url'), mine.iv);
+    decipher.setAuthTag(bytes.subarray(bytes.length - 16));
+    const plaintext = Buffer.concat([decipher.update(bytes.subarray(0, bytes.length - 16)), decipher.final()]);
+    assert.equal(plaintext[0], 0x03);
+    assert.equal(plaintext.readUInt16BE(1), name.length);
+    assert.deepEqual(plaintext.subarray(3, 3 + name.length), name);
+    assert.deepEqual(plaintext.subarray(3 + name.length), data);
+  });
+
+  it('認証は通っても構造が壊れているファイル封筒は UNSUPPORTED_FORMAT（境界を厳密に検査する）', async () => {
+    const u16 = (n: number) => Buffer.from([(n >> 8) & 0xff, n & 0xff]);
+    const malformed: Array<[string, Buffer]> = [
+      ['本体が 0 バイト', Buffer.from([0x03])],
+      ['名前長フィールドが 1 バイトしかない', Buffer.from([0x03, 0x00])],
+      ['名前長が残りより大きい', Buffer.concat([Buffer.from([0x03]), u16(5), Buffer.from('a')])],
+      ['名前長が 1024 を超える（データは十分にある）', Buffer.concat([Buffer.from([0x03]), u16(1025), Buffer.alloc(2000, 0x41)])],
+      ['名前が不正な UTF-8', Buffer.concat([Buffer.from([0x03]), u16(2), Buffer.from([0xff, 0xfe]), Buffer.from('data')])],
+    ];
+    for (const [label, plaintext] of malformed) {
+      const sealed = sealWithOpenSsl(plaintext);
+      await assert.rejects(decryptPayload(sealed.encrypted, sealed.iv, sealed.keyString), (error: unknown) => {
+        assert.ok(error instanceof CipherDropCryptoError, label);
+        assert.equal(error.code, 'UNSUPPORTED_FORMAT', label);
+        return true;
+      });
+    }
+  });
+
+  it('decryptPayload は種別つきで返す: text / binary / file。decryptData はファイルでは本体のバイト列だけを返す', async () => {
+    const text = await encryptData('hello');
+    assert.deepEqual(await decryptPayload(text.encryptedData, text.iv, text.keyString), { type: 'text', text: 'hello' });
+
+    const binary = await encryptData(toArrayBuffer(Buffer.from([1, 2, 3])));
+    const decryptedBinary = await decryptPayload(binary.encryptedData, binary.iv, binary.keyString);
+    assert.ok(decryptedBinary.type === 'binary');
+    assert.deepEqual(new Uint8Array(decryptedBinary.data), Uint8Array.from([1, 2, 3]));
+
+    const file = await encryptFile({ name: 'x.bin', data: toArrayBuffer(Buffer.from([9, 8, 7])) });
+    const viaData = await decryptData(file.encryptedData, file.iv, file.keyString);
+    assert.ok(viaData instanceof ArrayBuffer);
+    assert.deepEqual(new Uint8Array(viaData), Uint8Array.from([9, 8, 7]));
+  });
+
+  it('暗号文を 1 ビット改ざんすると、ファイルでも検出される', async () => {
+    const { encryptedData, iv, keyString } = await encryptFile({ name: 'a.txt', data: new ArrayBuffer(32) });
+    await assertCryptoError(decryptPayload(flipBit(encryptedData, 4), iv, keyString), 'DECRYPTION_FAILED');
+  });
+});
+
+describe('isValidKeyString', () => {
+  it('encryptData が作った鍵は有効。形式不正（長さ・文字種・# 付き・非正規表現・非文字列）は無効', async () => {
+    const { keyString } = await encryptData('x');
+    assert.equal(isValidKeyString(keyString), true);
+
+    const lastIndex = BASE64URL_ALPHABET.indexOf(keyString.at(-1) ?? '');
+    const nonCanonical = keyString.slice(0, -1) + BASE64URL_ALPHABET.charAt(lastIndex + 1);
+    for (const bad of ['', 'short', `#${keyString}`, `${keyString}A`, keyString.slice(1), `${keyString.slice(0, 42)}=`, nonCanonical]) {
+      assert.equal(isValidKeyString(bad), false, JSON.stringify(bad));
+    }
+    assert.equal(isValidKeyString(undefined as unknown as string), false);
+    assert.equal(isValidKeyString(null as unknown as string), false);
   });
 });
 

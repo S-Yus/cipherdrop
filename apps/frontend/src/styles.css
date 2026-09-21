@@ -1,0 +1,181 @@
+@import "tailwindcss";
+
+/*
+ * デザイントークン。色はすべてここで定義し、コンポーネントは意味（surface / muted / accent …）で参照する。
+ * 本文・警告色は WCAG AA（4.5:1）、操作部品の境界（--line-strong）は 3:1 以上になるよう数値で確認済み。
+ *
+ * ダークモード: OS 設定に自動で追従し、ヘッダーの切替ボタン（<html data-theme="light|dark">）で上書きできる。
+ * CSS に条件を共有する仕組みがないため、ダーク用のトークンは 2 か所（手動 / OS 設定）に同じ値を書いている。
+ */
+:root {
+  color-scheme: light;
+  --canvas: #f3f5f9;
+  --surface: #ffffff;
+  --sunken: #f6f7fb;
+  --line: #dfe3ea;
+  --line-strong: #818c9f;
+  --fg: #0f1729;
+  --muted: #485266;
+  --accent: #3730a3;
+  --accent-solid: #3730a3;
+  --accent-hover: #2b2582;
+  --accent-soft: #eceeff;
+  --on-accent: #ffffff;
+  --warn: #7a3b00;
+  --warn-bg: #fff7e0;
+  --warn-line: #b97a0c;
+  --danger: #9b1c1c;
+  --danger-bg: #fef1f1;
+  --danger-line: #c95a5a;
+  --ok: #14532d;
+  --ok-bg: #effbf2;
+  --ok-line: #63b985;
+  --shadow: 0 1px 2px rgb(15 23 41 / 0.06), 0 12px 28px -16px rgb(15 23 41 / 0.22);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #0a0e1a;
+  --surface: #121828;
+  --sunken: #0d1220;
+  --line: #252d40;
+  --line-strong: #63719a;
+  --fg: #e9edf6;
+  --muted: #a7b1c6;
+  --accent: #a5abff;
+  --accent-solid: #5b54f0;
+  --accent-hover: #6d67f6;
+  --accent-soft: #1b2044;
+  --on-accent: #ffffff;
+  --warn: #ffd58a;
+  --warn-bg: #2a2110;
+  --warn-line: #8a6a1f;
+  --danger: #ffb4b4;
+  --danger-bg: #2b1416;
+  --danger-line: #b04a4a;
+  --ok: #9be3b4;
+  --ok-bg: #0f2418;
+  --ok-line: #3f9a63;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 28px -16px rgb(0 0 0 / 0.6);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --canvas: #0a0e1a;
+    --surface: #121828;
+    --sunken: #0d1220;
+    --line: #252d40;
+    --line-strong: #63719a;
+    --fg: #e9edf6;
+    --muted: #a7b1c6;
+    --accent: #a5abff;
+    --accent-solid: #5b54f0;
+    --accent-hover: #6d67f6;
+    --accent-soft: #1b2044;
+    --on-accent: #ffffff;
+    --warn: #ffd58a;
+    --warn-bg: #2a2110;
+    --warn-line: #8a6a1f;
+    --danger: #ffb4b4;
+    --danger-bg: #2b1416;
+    --danger-line: #b04a4a;
+    --ok: #9be3b4;
+    --ok-bg: #0f2418;
+    --ok-line: #3f9a63;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 28px -16px rgb(0 0 0 / 0.6);
+  }
+}
+
+/* トークンを Tailwind のユーティリティ名にする（inline: 実行時に CSS 変数を参照するのでテーマ切替が効く）。 */
+@theme inline {
+  /* 外部フォントは読み込まない（第三者への通信を発生させない）。日本語は OS 標準の和文フォントを使う。 */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic UI", "Noto Sans JP", "Noto Sans CJK JP", "IPAexGothic", Meiryo, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-solid: var(--accent-solid);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+  --color-warn: var(--warn);
+  --color-warn-bg: var(--warn-bg);
+  --color-warn-line: var(--warn-line);
+  --color-danger: var(--danger);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-line: var(--danger-line);
+  --color-ok: var(--ok);
+  --color-ok-bg: var(--ok-bg);
+  --color-ok-line: var(--ok-line);
+  --shadow-card: var(--shadow);
+}
+
+@layer base {
+  html {
+    background-color: var(--canvas);
+    color: var(--fg);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    min-height: 100dvh;
+    font-family: var(--font-sans);
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /*
+   * 日本語の折り返し。既定だと「一|度」「サ|ーバー」のように語の途中で改行され、長音記号「ー」が行頭に来る。
+   *   auto-phrase   文節（フレーズ）の区切りで改行する（Chromium 系。未対応のブラウザは無視して通常の折り返し）
+   *   line-break    小書きのかな・「ー」を行頭にしない
+   *   text-wrap     段落末の孤立（1 文字だけの行）を避ける
+   */
+  html:lang(ja) {
+    word-break: auto-phrase;
+    line-break: strict;
+  }
+
+  p,
+  li,
+  dd {
+    text-wrap: pretty;
+  }
+
+  /* キーボード操作の現在位置を、すべての操作部品でくっきり示す。 */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent-soft);
+    color: var(--fg);
+  }
+
+  textarea,
+  input,
+  button {
+    font: inherit;
+  }
+}
+
+/* OS の「視差効果を減らす」設定を尊重する。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

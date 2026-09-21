@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- 共有リンクのフラグメント（鍵）を含め、遷移先に一切の参照元情報を渡さない -->
+    <meta name="referrer" content="no-referrer" />
+    <!-- 共有リンクは検索エンジンに載せない -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CipherDrop — 一度だけ開ける、安全な共有</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- 描画前にテーマを適用してチラつきを防ぐ。CSP（script-src 'self'）に合わせて外部ファイルにしている -->
+    <script src="/theme-init.js"></script>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>
+      <div class="mx-auto mt-16 max-w-xl rounded-xl border border-line-strong bg-surface p-6 text-fg">
+        <p class="font-semibold">JavaScript を有効にしてください</p>
+        <p class="mt-2 text-sm text-muted">
+          CipherDrop は、暗号化と復号をあなたのブラウザの中で行います。そのため JavaScript が必要です。
+        </p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
