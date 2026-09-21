@@ -12,6 +12,8 @@
   },
   "scripts": {
     "dev:backend": "npm run dev --workspace @cipherdrop/backend",
+    "dev:frontend": "npm run dev --workspace @cipherdrop/frontend",
+    "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces && tsc -p tests/tsconfig.json",
     "test": "node --test \"apps/*/src/**/*.test.ts\" \"tests/**/*.test.ts\"",
     "check": "npm run typecheck && npm test"
