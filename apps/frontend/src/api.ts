@@ -20,6 +20,10 @@ export const HEADER_TTL = 'X-CipherDrop-TTL';
 export const HEADER_TYPE = 'X-CipherDrop-Type';
 /** 鍵確認値（任意）。generateKeyCheckTag（crypto.ts）の出力をそのまま送る。鍵そのものではない。 */
 export const HEADER_KEY_CHECK = 'X-CipherDrop-Key-Check';
+/** consumeSecret の SHA-256 全体（必須）。generateConsumeSecret（crypto.ts）の verifierHex をそのまま送る。 */
+export const HEADER_CONSUME_VERIFIER = 'X-CipherDrop-Consume-Verifier';
+/** consumeSecret そのもの（必須）。共有 URL のハッシュ断片から取り出した secretString をそのまま送る。 */
+export const HEADER_CONSUME_SECRET = 'X-CipherDrop-Consume-Secret';
 
 export type PayloadType = 'text' | 'file';
 
@@ -73,9 +77,18 @@ export interface ApiClient {
     ttlSeconds: number;
     /** 鍵確認値（任意）。省略すると X-CipherDrop-Key-Check ヘッダー自体を送らない。 */
     keyCheck?: string;
+    /**
+     * consumeSecret（crypto.ts の generateConsumeSecret）の SHA-256 全体（16進 64 桁）。必須。
+     * keyCheck と異なり省略できない ―― これが無いと、正当な受信者であっても後で consume できない。
+     */
+    consumeVerifier: string;
   }): Promise<{ id: string; expiresAt: Date }>;
   getMeta(id: string): Promise<PayloadMeta>;
-  consume(id: string): Promise<{ encryptedData: ArrayBuffer; iv: Uint8Array }>;
+  /**
+   * @param consumeSecret 共有 URL のハッシュ断片から取り出した consumeSecret（crypto.ts の parseShareFragment）。
+   *   ID だけを知る第三者が、これを知らずに consume できてしまわないための必須の権限証明。
+   */
+  consume(id: string, consumeSecret: string): Promise<{ encryptedData: ArrayBuffer; iv: Uint8Array }>;
 }
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -113,7 +126,7 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
   }
 
   return {
-    async createPayload({ encryptedData, iv, type, ttlSeconds, keyCheck }) {
+    async createPayload({ encryptedData, iv, type, ttlSeconds, keyCheck, consumeVerifier }) {
       const response = await request('/api/payload', {
         method: 'POST',
         headers: {
@@ -121,6 +134,7 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
           [HEADER_IV]: base64UrlEncode(iv),
           [HEADER_TYPE]: type,
           [HEADER_TTL]: String(ttlSeconds),
+          [HEADER_CONSUME_VERIFIER]: consumeVerifier,
           // 任意: 省略すればヘッダー自体を送らない（サーバー側も旧クライアントと同じに扱う）。
           ...(keyCheck === undefined ? {} : { [HEADER_KEY_CHECK]: keyCheck }),
         },
@@ -154,8 +168,11 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
         : { type, size: size as number, expiresAt, keyCheck: keyCheck as string };
     },
 
-    async consume(id) {
-      const response = await request(`/api/payload/${assertId(id)}/consume`, { method: 'POST' });
+    async consume(id, consumeSecret) {
+      const response = await request(`/api/payload/${assertId(id)}/consume`, {
+        method: 'POST',
+        headers: { [HEADER_CONSUME_SECRET]: consumeSecret },
+      });
 
       const iv = base64UrlDecode(response.headers.get(HEADER_IV) ?? '');
       if (iv === null || iv.byteLength !== 12) throw new ApiError('invalid_response', response.status);

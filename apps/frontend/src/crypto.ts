@@ -321,6 +321,60 @@ function toHex(bytes: Uint8Array): string {
   return hex;
 }
 
+// ---------------------------------------------------------------------------
+// consumeSecret（消費権限の分離）
+//
+// 共有 URL は `/v/{id}#{encKey}.{consumeSecret}` の形をとる。encKey が復号のための鍵であるのに対し、
+// consumeSecret は「サーバーに consume（1 回読み切りの取得・削除）を許可してもらう」ためだけの、
+// 復号鍵とは完全に独立した 256bit の秘密。ID（URL パスに載るため、サーバーログや共有時の見た目に
+// 残り得る）だけを知る第三者が、復号鍵を知らないまま consume してデータを破棄できてしまう問題への対策。
+//
+// 作成時: このモジュールで生成した consumeSecret の SHA-256 全体（consumeVerifier）だけをサーバーに送る。
+// 消費時: consumeSecret そのもの（URL のハッシュ断片から取り出した値）をヘッダーで送り、サーバー側は
+//         受け取った値のハッシュを再計算して照合する（apps/backend/src/server.ts, store.ts 参照）。
+// ---------------------------------------------------------------------------
+
+export interface ConsumeSecret {
+  /** base64url・256bit。共有 URL のハッシュ断片に、鍵の後ろへ `.` で連結して載せる値。 */
+  secretString: string;
+  /** secretString の生バイト列の SHA-256 全体（16進小文字 64 桁）。作成リクエストの検証値として送る。 */
+  verifierHex: string;
+}
+
+/**
+ * consumeSecret を新規生成する。呼び出しごとに独立した乱数(鍵の生成とは無関係)。
+ * 復号鍵と同じ 256bit・base64url 形式を使うのは、鍵と同じ強度が必要という理由ではなく
+ * (こちらは総当たり耐性ではなく単なる知識の証明として使うため、256bit は十分すぎる)、
+ * 既存の isValidKeyString をそのまま検証に使い回せる、実装上の単純さのため。
+ */
+export async function generateConsumeSecret(): Promise<ConsumeSecret> {
+  const subtle = getSubtle();
+  const secretBytes = crypto.getRandomValues(new Uint8Array(KEY_BYTES));
+  const digest = new Uint8Array(await subtle.digest('SHA-256', secretBytes));
+  return { secretString: base64UrlEncode(secretBytes), verifierHex: toHex(digest) };
+}
+
+/** 共有 URL のフラグメント(`location.hash.slice(1)`)を分解した結果。 */
+export interface ShareFragment {
+  keyString: string;
+  consumeSecret: string;
+}
+
+/**
+ * 共有 URL のフラグメント（`#` の後ろの文字列）を `{encKey}.{consumeSecret}` として解析する。
+ * base64url の文字集合（[A-Za-z0-9_-]）はそもそも `.` を生成しないので、`.` で区切っても
+ * どちらの値にも `.` が紛れ込む余地がなく曖昧さがない（JWT が `.` を区切りに使うのと同じ理由）。
+ * どちらも鍵と同じ 256bit・base64url 形式なので、検証には isValidKeyString をそのまま使い回す。
+ */
+export function parseShareFragment(fragment: string): ShareFragment | null {
+  const parts = fragment.split('.');
+  if (parts.length !== 2) return null;
+  const [keyString, consumeSecret] = parts;
+  return keyString !== undefined && consumeSecret !== undefined && isValidKeyString(keyString) && isValidKeyString(consumeSecret)
+    ? { keyString, consumeSecret }
+    : null;
+}
+
 /** RFC 4648 §5 の base64url（パディング無し）。IV を HTTP ヘッダーで受け渡すときにも使う。 */
 export function base64UrlEncode(bytes: Uint8Array): string {
   let binary = '';

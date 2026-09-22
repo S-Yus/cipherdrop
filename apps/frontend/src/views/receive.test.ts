@@ -8,14 +8,36 @@ import { SAMPLE_ID, click, createTestEnv, has, meta, query, waitFor } from '../t
 import type { ApiCall, TestEnvOptions } from '../testing/env.ts';
 
 /**
+ * consumeSecret（必須）のテスト用の既定値。鍵と同じ 43 文字の base64url 形式（32 バイトを正規にエンコードした
+ * もの。isValidKeyString は非正規表現の 43 文字を拒否するため、単純な文字の繰り返しでは作れない）であればよく、
+ * 値そのものはモック API（下の open() の consume）が検証しない。
+ */
+const SAMPLE_CONSUME_SECRET = 'U1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1M';
+
+/**
  * 受取画面を開く。sealed の暗号文を返す API を用意し、鍵は sealed のものをリンクに載せる（key で上書き可）。
+ * 共有 URL のフラグメントは `{key}.{consumeSecret}` の形（crypto.ts の parseShareFragment 参照）。
+ * fragment を渡すと、key/consumeSecret を無視してフラグメント全体を直接指定する（不正な形そのものの検証用）。
  * keyCheck を渡すと meta 応答に含める（省略時は、これまでどおり keyCheck を含めない＝後方互換のケース）。
  */
-function open(sealed: EncryptedPayload, options: { type?: 'text' | 'file'; key?: string; path?: string; keyCheck?: string; env?: TestEnvOptions } = {}) {
+function open(
+  sealed: EncryptedPayload,
+  options: {
+    type?: 'text' | 'file';
+    key?: string;
+    consumeSecret?: string;
+    fragment?: string;
+    path?: string;
+    keyCheck?: string;
+    env?: TestEnvOptions;
+  } = {},
+) {
   const type = options.type ?? 'text';
   const key = options.key ?? sealed.keyString;
+  const consumeSecret = options.consumeSecret ?? SAMPLE_CONSUME_SECRET;
+  const fragment = options.fragment ?? (key === '' ? '' : `${key}.${consumeSecret}`);
   const t = createTestEnv({
-    url: `https://cipherdrop.io${options.path ?? `/v/${SAMPLE_ID}`}${key === '' ? '' : `#${key}`}`,
+    url: `https://cipherdrop.io${options.path ?? `/v/${SAMPLE_ID}`}${fragment === '' ? '' : `#${fragment}`}`,
     api: {
       getMeta: async () => ({
         ...meta(type, sealed.encryptedData.byteLength),
@@ -89,7 +111,7 @@ describe('受取画面 Stage 1（確認）: 開いただけでは何も消費し
       release = resolve;
     });
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         async getMeta() {
           await gate;
@@ -107,18 +129,19 @@ describe('受取画面 Stage 1（確認）: 開いただけでは何も消費し
 });
 
 describe('受取画面 Stage 2（消費・復号）: 「開く」を押したときだけ', () => {
-  it('ボタンで consume を 1 回だけ呼び、復号したテキストを表示する。アドレスバーから鍵が消える', async () => {
+  it('ボタンで consume を 1 回だけ呼び、復号したテキストを表示する。アドレスバーからは、マウント時点で既に鍵が消えている', async () => {
     const sealed = await encryptData('山田様\n口座番号: 0123-4567');
     const t = open(sealed);
     await untilConfirm(t);
-    assert.equal(t.window.location.hash, `#${sealed.keyString}`, '確認段階では、リロードできるよう鍵は URL に残す');
+    assert.equal(t.window.location.hash, '', '確認段階では既に鍵が URL から消えている（マウント時点で即座に消去する。プライバシー保護のため）');
 
     click(openButton(t));
     const output = await waitFor(() => t.main.querySelector('[data-testid="decrypted-text"]'));
 
     assert.equal(output.textContent, '山田様\n口座番号: 0123-4567');
     assert.deepEqual(methods(t), ['getMeta', 'consume']);
-    assert.equal(t.window.location.hash, '', '取得（消滅）後は、URL から鍵を消す');
+    assert.deepEqual(t.calls[1]?.args, [SAMPLE_ID, SAMPLE_CONSUME_SECRET], 'consume には ID と、URL から取り出した consumeSecret を渡す');
+    assert.equal(t.window.location.hash, '', '取得後も、引き続き URL に鍵は無い');
     assert.equal(t.window.location.pathname, `/v/${SAMPLE_ID}`);
     assert.match(t.main.textContent ?? '', /サーバー上のデータは削除済みです/);
     assert.equal(t.doc.activeElement?.tagName, 'H1', '結果の見出しにフォーカスが移る');
@@ -146,7 +169,7 @@ describe('受取画面 Stage 2（消費・復号）: 「開く」を押したと
       release = resolve;
     });
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         getMeta: async () => meta('text'),
         async consume() {
@@ -310,6 +333,38 @@ describe('受取画面: 不完全なリンクは、消費する前に止める�
     assert.match(t.main.textContent ?? '', /リンクが不正です/);
     assert.equal(t.calls.length, 0);
   });
+
+  it('consumeSecret が欠けている・形式不正なリンクも同様に「リンクが正しくありません」。鍵の部分が正しくても止める', async () => {
+    const sealed = await encryptData('x');
+    const badSecrets: Array<[string, string]> = [
+      ['短い（途中で切れた）', SAMPLE_CONSUME_SECRET.slice(0, 30)],
+      ['1 文字だけ足りない', SAMPLE_CONSUME_SECRET.slice(0, 42)],
+      ['余分な文字', `${SAMPLE_CONSUME_SECRET}A`],
+      ['標準 base64 の記号', `${SAMPLE_CONSUME_SECRET.slice(0, 42)}+`],
+      ['空文字（末尾がピリオドだけになる）', ''],
+    ];
+    for (const [label, badSecret] of badSecrets) {
+      const t = open(sealed, { consumeSecret: badSecret });
+      assert.match(t.main.textContent ?? '', /リンクが不正です/, label);
+      assert.equal(t.calls.length, 0, `${label}: API を呼んでいない`);
+    }
+  });
+
+  it('区切り「.」が無い旧形式のリンク（鍵だけ）は、consumeSecret が読み取れないため「リンクが正しくありません」', async () => {
+    // アップグレード前に発行された共有リンクは `#{key}` の形しか持たない。
+    // consumeSecret 無しでは consume できないので、無効なリンクとして扱う（サーバーへの問い合わせもしない）。
+    const sealed = await encryptData('x');
+    const t = open(sealed, { fragment: sealed.keyString });
+    assert.match(t.main.textContent ?? '', /リンクが不正です/);
+    assert.equal(t.calls.length, 0);
+  });
+
+  it('区切り「.」が複数あるリンクも「リンクが正しくありません」（2 分割できない）', async () => {
+    const sealed = await encryptData('x');
+    const t = open(sealed, { fragment: `${sealed.keyString}.${SAMPLE_CONSUME_SECRET}.extra` });
+    assert.match(t.main.textContent ?? '', /リンクが不正です/);
+    assert.equal(t.calls.length, 0);
+  });
 });
 
 describe('受取画面: 鍵確認値（形式は正しいが内容が違う鍵を、消費する前に止める）', () => {
@@ -367,7 +422,7 @@ describe('受取画面: 鍵確認値（形式は正しいが内容が違う鍵�
 describe('受取画面: エラー', () => {
   it('meta が 404（消費済み・期限切れ・存在しない）は「このリンクは無効です」', async () => {
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${(await encryptData('x')).keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${(await encryptData('x')).keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         getMeta: async () => {
           throw new ApiError('not_found', 404);
@@ -382,7 +437,7 @@ describe('受取画面: エラー', () => {
   it('consume が 404（確認後に他の人が先に開いた）でも「このリンクは無効です」', async () => {
     const sealed = await encryptData('x');
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         getMeta: async () => meta('text'),
         consume: async () => {
@@ -400,7 +455,7 @@ describe('受取画面: エラー', () => {
     const sealed = await encryptData('x');
     let attempts = 0;
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         async getMeta() {
           if (++attempts === 1) throw new ApiError('network');
@@ -416,11 +471,11 @@ describe('受取画面: エラー', () => {
     assert.equal(attempts, 2);
   });
 
-  it('consume の通信エラーは再試行できる。失敗の間は、リロードできるよう URL の鍵を残す', async () => {
+  it('consume の通信エラーは再試行できる。URL の鍵は既にマウント時点で消えているが、メモリ上の値で再試行できる', async () => {
     const sealed = await encryptData('再試行で読める');
     let attempts = 0;
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         getMeta: async () => meta('text'),
         async consume() {
@@ -431,19 +486,25 @@ describe('受取画面: エラー', () => {
     });
     mountApp(t.env);
     await waitFor(() => has(t.main, '[data-action="open"]'));
+    assert.equal(t.window.location.hash, '', 'マウント時点で既に消去済み');
 
     click(query(t.main, '[data-action="open"]'));
     await waitFor(() => /取得に失敗しました/.test(t.main.textContent ?? ''));
-    assert.equal(t.window.location.hash, `#${sealed.keyString}`, '取得に失敗した間は鍵を消さない');
+    assert.equal(t.window.location.hash, '', '取得に失敗しても、URL の状態は変わらない（元々空のまま）');
 
+    // URL には鍵も consumeSecret も無いが、この画面のメモリ上にはまだ残っているので再試行が機能する。
     click(query(t.main, '[data-action="retry-open"]'));
     const output = await waitFor(() => t.main.querySelector('[data-testid="decrypted-text"]'));
     assert.equal(output.textContent, '再試行で読める');
     assert.equal(attempts, 2);
+    assert.deepEqual(t.calls.filter((c) => c.method === 'consume').map((c) => c.args), [
+      [SAMPLE_ID, SAMPLE_CONSUME_SECRET],
+      [SAMPLE_ID, SAMPLE_CONSUME_SECRET],
+    ]);
     assert.equal(t.window.location.hash, '');
   });
 
-  it('鍵が違う（形式は正しい）場合は復号に失敗する。取得済みなので鍵は URL から消え、本文は出さない', async () => {
+  it('鍵が違う（形式は正しい）場合は復号に失敗する。URL には元々鍵が無く、本文も出さない', async () => {
     const sealed = await encryptData('本文');
     const other = await encryptData('別の鍵');
     const t = open(sealed, { key: other.keyString });
@@ -462,7 +523,7 @@ describe('受取画面: エラー', () => {
     const tampered = new Uint8Array(sealed.encryptedData);
     tampered[0] = (tampered[0] ?? 0) ^ 0x01;
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: { getMeta: async () => meta('text'), consume: async () => ({ encryptedData: tampered.buffer, iv: sealed.iv }) },
     });
     mountApp(t.env);
@@ -480,7 +541,7 @@ describe('受取画面: エラー', () => {
       release = resolve;
     });
     const t = createTestEnv({
-      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}`,
+      url: `https://cipherdrop.io/v/${SAMPLE_ID}#${sealed.keyString}.${SAMPLE_CONSUME_SECRET}`,
       api: {
         async getMeta() {
           await gate;

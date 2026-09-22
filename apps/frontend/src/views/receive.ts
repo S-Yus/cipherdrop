@@ -14,7 +14,7 @@
  */
 import { ApiError } from '../api.ts';
 import type { PayloadMeta } from '../api.ts';
-import { decryptPayload, generateKeyCheckTag, isValidKeyString, renderTextSafely } from '../crypto.ts';
+import { decryptPayload, generateKeyCheckTag, parseShareFragment, renderTextSafely } from '../crypto.ts';
 import type { DecryptedPayload } from '../crypto.ts';
 import { createDom, cx } from '../dom.ts';
 import type { Children } from '../dom.ts';
@@ -42,10 +42,29 @@ const COPY_FEEDBACK_MS = 2_500;
 export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { id: string | null }): ViewHandle {
   const dom = createDom(env.doc);
   const id = route.id;
-  // 鍵はページ内のメモリにだけ置く。サーバーへ送る経路はない（api.ts の関数は鍵を受け取れない）。
-  let keyString = env.location.hash.startsWith('#') ? env.location.hash.slice(1) : '';
+  const rawFragment = env.location.hash.startsWith('#') ? env.location.hash.slice(1) : '';
+  const parsedFragment = parseShareFragment(rawFragment);
+  // 鍵と consumeSecret はページ内のメモリにだけ置く。サーバーへ送る経路はない
+  // （keyString はどの api.ts の関数にも渡せない。consumeSecret は consume() にしか渡せない）。
+  let keyString = parsedFragment?.keyString ?? '';
+  let consumeSecret = parsedFragment?.consumeSecret ?? '';
+
+  // フラグメントをオンメモリに読み込んだ直後、ネットワークリクエスト（meta の取得）を開始する前に、
+  // アドレスバー・ブラウザ履歴からハッシュを消す。形式の有効・無効に関わらず消す ―― 形式不正なリンクの
+  // 断片であっても、他人に見せたくない秘密の断片的な値であることに変わりはない。
+  //
+  // トレードオフ（意図したもの。バグではない）: これより前は「確認（confirm）段階でリロードしても、
+  // URL に鍵が残っているので再取得できる」という復旧性があったが、この消去によって失われる。
+  // 消去後にリロードすると、鍵はこのページのメモリからも失われるため、送信者から共有された元のリンクを
+  // 開き直す必要がある（replaceState は履歴エントリを置き換えるため、ブラウザの「戻る」でも戻れない）。
+  // consume 自体の通信エラーによる再試行は、URL ではなくこの関数内のメモリ（keyString/consumeSecret）を
+  // 使うので影響を受けない（下の open() 参照）。詳細は receive.test.ts のコメントも参照。
+  if (env.location.hash !== '') {
+    env.history.replaceState(null, '', env.location.pathname);
+  }
+
   // リンクが不完全なら、暗号文を「消費する前に」止める。形式不正の鍵で開くと、データだけが失われる。
-  let phase: Phase = id !== null && isValidKeyString(keyString) ? { name: 'loading' } : { name: 'invalid-link' };
+  let phase: Phase = id !== null && parsedFragment !== null ? { name: 'loading' } : { name: 'invalid-link' };
   let pendingFocus: string | null = null;
   let feedbackTimer: unknown = null;
   let destroyed = false;
@@ -274,9 +293,12 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
 
     let consumed: { encryptedData: ArrayBuffer; iv: Uint8Array };
     try {
-      consumed = await env.api.consume(id);
+      consumed = await env.api.consume(id, consumeSecret);
     } catch (error) {
       if (destroyed) return;
+      // 通信エラーはここで return する（keyString/consumeSecret はまだ手放さない）ので、
+      // 「再試行」ボタン（onClick: () => void open(meta)）はメモリ上の値でもう一度 consume できる。
+      // アドレスバーの鍵は mount 時点で既に消去済みなので、この再試行可否は URL の状態と無関係。
       phase = error instanceof ApiError && error.code === 'not_found' ? { name: 'unavailable' } : { name: 'open-error', meta };
       pendingFocus = '[data-autofocus]';
       render();
@@ -284,15 +306,13 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
     }
     if (destroyed) return;
 
-    // ここから先、サーバーの暗号文は消滅済み。アドレスバーから鍵を消す（履歴・画面共有・URL のコピーに残さない）。
-    env.history.replaceState(null, '', env.location.pathname);
-
     try {
       phase = present(await decryptPayload(consumed.encryptedData, consumed.iv, keyString));
     } catch {
       phase = { name: 'decrypt-failed' };
     } finally {
       keyString = ''; // 用済みの鍵をこのビューから手放す
+      consumeSecret = ''; // 用済みの consumeSecret も手放す
     }
     pendingFocus = '[data-autofocus]';
     render();

@@ -1,10 +1,19 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { describe, it } from 'node:test';
 import type { TestContext } from 'node:test';
-import { createServer, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_KEY_CHECK, HEADER_TTL, HEADER_TYPE } from './server.ts';
+import {
+  createServer,
+  DEFAULT_TTL_SECONDS,
+  HEADER_CONSUME_SECRET,
+  HEADER_CONSUME_VERIFIER,
+  HEADER_IV,
+  HEADER_KEY_CHECK,
+  HEADER_TTL,
+  HEADER_TYPE,
+} from './server.ts';
 import type { LogEvent, ServerOptions } from './server.ts';
 import { InMemoryPayloadStore } from './store.ts';
 import type { InMemoryStoreOptions, PayloadMeta, StoredPayload } from './store.ts';
@@ -16,7 +25,7 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 // テスト用の部品
 // ---------------------------------------------------------------------------
 
-/** 保存・確認・取得の呼び出しを記録するストア（サーバーが「何を受け取り、何を保存したか」を検査する）。 */
+/** 保存・確認・取得の呼び出しを記録するストア(サーバーが「何を受け取り、何を保存したか」を検査する)。 */
 class RecordingStore extends InMemoryPayloadStore {
   readonly puts: Array<{ id: string; payload: StoredPayload; ttlSeconds: number }> = [];
   readonly stats: string[] = [];
@@ -32,9 +41,9 @@ class RecordingStore extends InMemoryPayloadStore {
     return super.stat(id);
   }
 
-  override async take(id: string) {
+  override async take(id: string, consumeSecret: Uint8Array) {
     this.takes.push(id);
-    return super.take(id);
+    return super.take(id, consumeSecret);
   }
 }
 
@@ -49,12 +58,17 @@ function deferred() {
 /** take() で削除を終えた直後に止まるストア。「削除 → 応答」の順序を検査するために使う。 */
 class GatedStore extends RecordingStore {
   readonly deleted = deferred();
-  readonly release = deferred();
+  /**
+   * テスト側から take() の完了タイミングを制御するためのゲート。素朴に release という名前にすると
+   * PayloadStore.release(bytes: number): void(容量予約の解放)と衝突するため、releaseGate という名前にしている。
+   * こちらは容量予約とは無関係の、テスト同期専用の仕組み。
+   */
+  readonly releaseGate = deferred();
 
-  override async take(id: string) {
-    const result = await super.take(id);
+  override async take(id: string, consumeSecret: Uint8Array) {
+    const result = await super.take(id, consumeSecret);
     this.deleted.resolve();
-    await this.release.promise;
+    await this.releaseGate.promise;
     return result;
   }
 }
@@ -107,10 +121,15 @@ async function startHarness<S extends RecordingStore = RecordingStore>(
 }
 
 function makeUpload(size = 48) {
-  return { ciphertext: new Uint8Array(randomBytes(size)), iv: new Uint8Array(randomBytes(12)) };
+  return { ciphertext: new Uint8Array(randomBytes(size)), iv: new Uint8Array(randomBytes(12)), consumeSecret: new Uint8Array(randomBytes(32)) };
 }
 
 type Upload = ReturnType<typeof makeUpload>;
+
+/** consumeSecret(生の 32 バイト)から X-CipherDrop-Consume-Verifier ヘッダー値(SHA-256 全体・16進小文字 64 桁)を導出する。 */
+function verifierHeaderOf(consumeSecret: Uint8Array): string {
+  return createHash('sha256').update(consumeSecret).digest('hex');
+}
 
 /** POST /api/payload。headers に undefined を渡すとそのヘッダーを送らない。種別ヘッダーの既定は text。 */
 function postPayload(
@@ -123,6 +142,7 @@ function postPayload(
     'content-type': 'application/octet-stream',
     [HEADER_IV]: Buffer.from(upload.iv).toString('base64url'),
     [HEADER_TYPE]: 'text',
+    [HEADER_CONSUME_VERIFIER]: verifierHeaderOf(upload.consumeSecret),
     ...headers,
   };
   const defined = Object.entries(merged).filter((entry): entry is [string, string] => entry[1] !== undefined);
@@ -137,17 +157,35 @@ async function createSecret(h: Harness<RecordingStore>, headers: Record<string, 
   return { ...upload, ...body };
 }
 
-/** GET /api/payload/:id/meta（確認。何も消費しない）。 */
+/** GET /api/payload/:id/meta(確認。何も消費しない)。 */
 function getMeta(h: Harness<RecordingStore>, id: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`${h.baseUrl}/api/payload/${id}/meta`, init);
 }
 
-/** POST /api/payload/:id/consume（消費。暗号文を返し、返す前に削除する）。 */
-function consume(h: Harness<RecordingStore>, id: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${h.baseUrl}/api/payload/${id}/consume`, { method: 'POST', ...init });
+/**
+ * POST /api/payload/:id/consume(消費。暗号文を返し、返す前に削除する)。
+ * secret は createSecret() の戻り値(id と、作成時に使った consumeSecret の両方を持つ)を渡す。
+ * ID だけ分かっていて対応する consumeSecret を知らない状況を作るには unknownSecret(id) を使う。
+ */
+function consume(
+  h: Harness<RecordingStore>,
+  secret: { id: string; consumeSecret: Uint8Array },
+  overrides: { method?: string; headers?: Record<string, string | undefined> } = {},
+): Promise<Response> {
+  const merged: Record<string, string | undefined> = {
+    [HEADER_CONSUME_SECRET]: Buffer.from(secret.consumeSecret).toString('base64url'),
+    ...overrides.headers,
+  };
+  const defined = Object.entries(merged).filter((entry): entry is [string, string] => entry[1] !== undefined);
+  return fetch(`${h.baseUrl}/api/payload/${secret.id}/consume`, { method: overrides.method ?? 'POST', headers: Object.fromEntries(defined) });
 }
 
-/** 生の TCP で HTTP を送る（fetch では作れない不正なパス・chunked・途中切断などのため）。 */
+/** ID は分かっているが、対応する consumeSecret を知らない(=未発行 ID や他人の共有リンクを想定した)状況を作る。 */
+function unknownSecret(id: string): { id: string; consumeSecret: Uint8Array } {
+  return { id, consumeSecret: new Uint8Array(randomBytes(32)) };
+}
+
+/** 生の TCP で HTTP を送る(fetch では作れない不正なパス・chunked・途中切断などのため)。 */
 function rawExchange(port: number, request: string | Buffer): Promise<string> {
   return new Promise((resolve) => {
     const socket = connect(port, '127.0.0.1');
@@ -169,7 +207,7 @@ function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/payload', () => {
-  it('ID と有効期限を返し、暗号文・IV・種別だけをそのまま保存する', async (t) => {
+  it('ID と有効期限を返し、暗号文・IV・種別・consumeVerifier だけをそのまま保存する', async (t) => {
     const h = await startHarness(t);
     const upload = makeUpload(64);
 
@@ -184,10 +222,15 @@ describe('POST /api/payload', () => {
     assert.equal(h.store.puts.length, 1);
     const [stored] = h.store.puts;
     assert.equal(stored?.id, body.id);
-    assert.deepEqual(Object.keys(stored?.payload ?? {}).sort(), ['ciphertext', 'iv', 'type'], '保存するのは暗号文・IV・種別ヒントだけ');
+    assert.deepEqual(
+      Object.keys(stored?.payload ?? {}).sort(),
+      ['ciphertext', 'consumeVerifier', 'iv', 'type'],
+      '保存するのは暗号文・IV・種別ヒント・消費用秘密鍵の検証値だけ',
+    );
     assert.deepEqual(new Uint8Array(stored?.payload.ciphertext ?? []), upload.ciphertext);
     assert.deepEqual(new Uint8Array(stored?.payload.iv ?? []), upload.iv);
     assert.equal(stored?.payload.type, 'text');
+    assert.equal(Buffer.from(stored?.payload.consumeVerifier ?? new Uint8Array()).toString('hex'), verifierHeaderOf(upload.consumeSecret));
   });
 
   it('種別ヒントは text / file のどちらも受け付けて保存する', async (t) => {
@@ -241,7 +284,7 @@ describe('POST /api/payload', () => {
       { name: 'IV ヘッダーなし', headers: { [HEADER_IV]: undefined }, status: 400, error: 'invalid_iv' },
       { name: 'IV が短い (11 バイト)', headers: { [HEADER_IV]: randomBytes(11).toString('base64url') }, status: 400, error: 'invalid_iv' },
       { name: 'IV が長い (13 バイト)', headers: { [HEADER_IV]: randomBytes(13).toString('base64url') }, status: 400, error: 'invalid_iv' },
-      { name: 'IV が標準 base64（+ / =）', headers: { [HEADER_IV]: 'AAAA+/AAAAAAAAA=' }, status: 400, error: 'invalid_iv' },
+      { name: 'IV が標準 base64(+ / =)', headers: { [HEADER_IV]: 'AAAA+/AAAAAAAAA=' }, status: 400, error: 'invalid_iv' },
       { name: 'IV が空', headers: { [HEADER_IV]: '' }, status: 400, error: 'invalid_iv' },
       { name: '種別ヘッダーなし', headers: { [HEADER_TYPE]: undefined }, status: 400, error: 'invalid_type' },
       { name: '種別が未定義の値 (image)', headers: { [HEADER_TYPE]: 'image' }, status: 400, error: 'invalid_type' },
@@ -256,7 +299,7 @@ describe('POST /api/payload', () => {
     ];
 
     for (const { name, headers, bodySize, status, error } of cases) {
-      it(`${name} → ${status} ${error}（保存しない）`, async (t) => {
+      it(`${name} → ${status} ${error}(保存しない)`, async (t) => {
         const h = await startHarness(t);
         const upload = makeUpload(bodySize ?? 48);
         const response = await postPayload(h, upload, headers);
@@ -272,7 +315,7 @@ describe('POST /api/payload', () => {
       assert.equal((await postPayload(h, makeUpload(), { 'content-type': 'Application/Octet-Stream; charset=binary' })).status, 201);
     });
 
-    it('クエリ文字列は 400 で拒否する（鍵などをクエリに載せる実装ミスを即発見できるように）', async (t) => {
+    it('クエリ文字列は 400 で拒否する(鍵などをクエリに載せる実装ミスを即発見できるように)', async (t) => {
       const h = await startHarness(t);
       const response = await fetch(`${h.baseUrl}/api/payload?ttl=60&key=SECRETKEY`, {
         method: 'POST',
@@ -288,7 +331,7 @@ describe('POST /api/payload', () => {
       assert.equal(h.store.puts.length, 0);
     });
 
-    it('POST 以外のメソッドは 405（Allow: POST）', async (t) => {
+    it('POST 以外のメソッドは 405(Allow: POST)', async (t) => {
       const h = await startHarness(t);
       for (const method of ['GET', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']) {
         const response = await fetch(`${h.baseUrl}/api/payload`, { method });
@@ -313,11 +356,12 @@ describe('POST /api/payload', () => {
     it('Content-Length を持たない chunked 送信でも、上限を超えた時点で 413 にして保存しない', async (t) => {
       const h = await startHarness(t, { server: { maxPayloadBytes: 1024 } });
       const iv = Buffer.alloc(12, 1).toString('base64url');
+      const verifier = verifierHeaderOf(new Uint8Array(randomBytes(32)));
       const chunk = Buffer.alloc(2048, 0x41);
       const request = Buffer.concat([
         Buffer.from(
           `POST /api/payload HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n` +
-            `${HEADER_IV}: ${iv}\r\n${HEADER_TYPE}: file\r\nTransfer-Encoding: chunked\r\n\r\n${chunk.length.toString(16)}\r\n`,
+            `${HEADER_IV}: ${iv}\r\n${HEADER_TYPE}: file\r\n${HEADER_CONSUME_VERIFIER}: ${verifier}\r\nTransfer-Encoding: chunked\r\n\r\n${chunk.length.toString(16)}\r\n`,
         ),
         chunk,
         Buffer.from('\r\n0\r\n\r\n'),
@@ -328,7 +372,7 @@ describe('POST /api/payload', () => {
       assert.equal(h.store.puts.length, 0);
     });
 
-    it('保存容量が上限に達すると 503 storage_full。消費して空きができれば再び保存できる', async (t) => {
+    it('保存容量(バイト数)が上限に達すると、本文を読む前に 503 storage_full。消費して空きができれば再び保存できる', async (t) => {
       const h = await startHarness(t, { storeOptions: { maxTotalBytes: 100 } });
       const first = await createSecret(h); // 48 + 12 = 60 バイト
 
@@ -337,20 +381,52 @@ describe('POST /api/payload', () => {
       assert.equal(rejected.headers.get('retry-after'), '60');
       assert.deepEqual(await rejected.json(), { error: 'storage_full' });
 
-      assert.equal((await consume(h, first.id)).status, 200);
+      assert.equal((await consume(h, first)).status, 200);
       assert.equal((await postPayload(h)).status, 201);
+    });
+
+    it('容量不足で予約できない場合、宣言サイズの本文を 1 バイトも送らなくても 503 が返る(本文を読みにいかない証拠)', async (t) => {
+      const h = await startHarness(t, { storeOptions: { maxTotalBytes: 100 } });
+      await createSecret(h); // 60 バイト消費(残り 40 バイト)
+      const iv = Buffer.alloc(12, 3).toString('base64url');
+      const verifier = verifierHeaderOf(new Uint8Array(randomBytes(32)));
+
+      // Content-Length: 1000 と宣言するが、本文は 1 バイトも送らない。
+      // サーバーが「予約できないなら本文を読まずに即座に 503」を実装しているなら、
+      // 本文を送らなくても応答が届く(＝サーバーが本文を待ちにいっていない)はず。
+      // もし実装が本文を読みにいってしまっていれば、二度と届かないデータを待ち続けて
+      // rawExchange 内蔵の 3 秒タイムアウトで打ち切られ、response が空文字列のままアサーションに失敗する。
+      const response = await rawExchange(
+        h.port,
+        `POST /api/payload HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n` +
+          `${HEADER_IV}: ${iv}\r\n${HEADER_TYPE}: text\r\n${HEADER_CONSUME_VERIFIER}: ${verifier}\r\nContent-Length: 1000\r\n\r\n`,
+      );
+
+      assert.match(response, /^HTTP\/1\.1 503 /, '本文を送っていないのに応答が届いた = 本文を読みにいっていない');
+      assert.equal(h.store.puts.length, 1, '既存の 1 件だけで、新規は保存されていない');
+    });
+
+    it('件数上限(maxEntries)に達すると、バイト容量が十分でも 503 storage_full', async (t) => {
+      const h = await startHarness(t, { storeOptions: { maxEntries: 1 } });
+      await createSecret(h);
+
+      const rejected = await postPayload(h);
+      assert.equal(rejected.status, 503);
+      assert.deepEqual(await rejected.json(), { error: 'storage_full' });
+      assert.equal(h.store.puts.length, 1);
     });
 
     it('アップロード途中でクライアントが切断しても、サーバーは落ちず何も保存しない', async (t) => {
       const h = await startHarness(t);
       const iv = Buffer.alloc(12, 2).toString('base64url');
+      const verifier = verifierHeaderOf(new Uint8Array(randomBytes(32)));
       const socket = connect(h.port, '127.0.0.1');
       socket.on('error', () => {});
       await new Promise<void>((resolve) => socket.once('connect', resolve));
       // Content-Length: 1000 と宣言しながら 10 バイトだけ送り、残りを送らずに切断する
       socket.write(
         `POST /api/payload HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\n${HEADER_IV}: ${iv}\r\n` +
-          `${HEADER_TYPE}: text\r\nContent-Length: 1000\r\n\r\n0123456789`,
+          `${HEADER_TYPE}: text\r\n${HEADER_CONSUME_VERIFIER}: ${verifier}\r\nContent-Length: 1000\r\n\r\n0123456789`,
       );
       await sleep(30);
       socket.destroy();
@@ -360,7 +436,7 @@ describe('POST /api/payload', () => {
       assert.equal((await postPayload(h)).status, 201, '切断の後も通常のリクエストを処理できる');
     });
 
-    it('ロガーが例外を投げても、リクエストは成功しサーバーは落ちない（プロセス停止は未読データの全消失になる）', async (t) => {
+    it('ロガーが例外を投げても、リクエストは成功しサーバーは落ちない(プロセス停止は未読データの全消失になる)', async (t) => {
       const h = await startHarness(t, {
         server: {
           log: () => {
@@ -371,8 +447,8 @@ describe('POST /api/payload', () => {
 
       const secret = await createSecret(h);
       await sleep(50); // 未処理の reject があれば、この間にテストランナーが検出する
-      assert.equal((await consume(h, secret.id)).status, 200);
-      assert.equal((await consume(h, secret.id)).status, 404);
+      assert.equal((await consume(h, secret)).status, 200);
+      assert.equal((await consume(h, secret)).status, 404);
     });
 
     it('想定外の例外は 500 internal_error だけを返し、内部情報・入力値をレスポンスにもログにも出さない', async (t) => {
@@ -387,7 +463,7 @@ describe('POST /api/payload', () => {
   });
 });
 
-describe('POST /api/payload: 鍵確認値（X-CipherDrop-Key-Check、任意）', () => {
+describe('POST /api/payload: 鍵確認値(X-CipherDrop-Key-Check、任意)', () => {
   it('付けて作成すると、そのまま保存され、meta のレスポンスにも現れる', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h, { [HEADER_KEY_CHECK]: 'deadbeef' });
@@ -397,7 +473,7 @@ describe('POST /api/payload: 鍵確認値（X-CipherDrop-Key-Check、任意）',
     assert.equal(body.keyCheck, 'deadbeef');
   });
 
-  it('付けずに作成すると、meta のレスポンス JSON に "keyCheck" キー自体が現れない（後方互換）', async (t) => {
+  it('付けずに作成すると、meta のレスポンス JSON に "keyCheck" キー自体が現れない(後方互換)', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
 
@@ -417,8 +493,46 @@ describe('POST /api/payload: 鍵確認値（X-CipherDrop-Key-Check、任意）',
   }
 });
 
+describe('POST /api/payload: 消費用秘密鍵の検証値(X-CipherDrop-Consume-Verifier、必須)', () => {
+  it('meta のレスポンスには一切現れない(consume の権限検証だけに使う内部情報)', async (t) => {
+    const h = await startHarness(t);
+    const secret = await createSecret(h);
+
+    const text = await (await getMeta(h, secret.id)).text();
+    assert.equal(text.includes('consumeVerifier'), false);
+    assert.equal(text.includes(verifierHeaderOf(secret.consumeSecret)), false);
+  });
+
+  it('ヘッダーが無いと 400 invalid_consume_verifier で、保存しない(keyCheck と違い省略できない)', async (t) => {
+    const h = await startHarness(t);
+    const response = await postPayload(h, makeUpload(), { [HEADER_CONSUME_VERIFIER]: undefined });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'invalid_consume_verifier' });
+    assert.equal(h.store.puts.length, 0);
+  });
+
+  const badVerifiers: Array<{ name: string; value: string }> = [
+    { name: '短すぎる', value: 'short' },
+    { name: 'keyCheck 用の 8 桁(長さが違う)', value: 'deadbeef' },
+    { name: '大文字を含む', value: 'DEADBEEF'.repeat(8) },
+    { name: '16進数でない文字を含む', value: 'g'.repeat(64) },
+    { name: '63 桁(1 桁短い)', value: 'a'.repeat(63) },
+    { name: '65 桁(1 桁長い)', value: 'a'.repeat(65) },
+    { name: '空文字', value: '' },
+  ];
+  for (const { name, value } of badVerifiers) {
+    it(`形式が不正(${name})だと 400 invalid_consume_verifier で、保存しない`, async (t) => {
+      const h = await startHarness(t);
+      const response = await postPayload(h, makeUpload(), { [HEADER_CONSUME_VERIFIER]: value });
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: 'invalid_consume_verifier' });
+      assert.equal(h.store.puts.length, 0);
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
-// GET /api/payload/:id/meta  （確認: 何も消費しない）
+// GET /api/payload/:id/meta  (確認: 何も消費しない)
 // ---------------------------------------------------------------------------
 
 describe('GET /api/payload/:id/meta', () => {
@@ -443,6 +557,8 @@ describe('GET /api/payload/:id/meta', () => {
       Buffer.from(secret.ciphertext).toString('hex'),
       Buffer.from(secret.iv).toString('base64url'),
       Buffer.from(secret.iv).toString('hex'),
+      Buffer.from(secret.consumeSecret).toString('base64url'),
+      verifierHeaderOf(secret.consumeSecret),
     ]) {
       assert.equal(text.includes(leaked), false);
     }
@@ -457,12 +573,12 @@ describe('GET /api/payload/:id/meta', () => {
     assert.equal(h.store.takes.length, 0, 'meta は take() を呼ばない');
     assert.equal(h.store.size, 1, '暗号文はストアに残っている');
 
-    const consumed = await consume(h, secret.id);
+    const consumed = await consume(h, secret);
     assert.equal(consumed.status, 200);
     assert.deepEqual(new Uint8Array(await consumed.arrayBuffer()), secret.ciphertext);
   });
 
-  it('有効期限を延ばさない（何度呼んでも expiresAt は変わらない）', async (t) => {
+  it('有効期限を延ばさない(何度呼んでも expiresAt は変わらない)', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h, { [HEADER_TTL]: '60' });
 
@@ -476,7 +592,7 @@ describe('GET /api/payload/:id/meta', () => {
   it('未発行・消費済み・期限切れは、すべて同じ 404 not_found', async (t) => {
     const h = await startHarness(t);
     const consumed = await createSecret(h);
-    await consume(h, consumed.id);
+    await consume(h, consumed);
     const expired = await createSecret(h, { [HEADER_TTL]: '60' });
     h.advanceClock(61_000);
 
@@ -491,7 +607,7 @@ describe('GET /api/payload/:id/meta', () => {
     }
   });
 
-  it('meta は期限切れでも削除しない（副作用なし）。削除は consume / 掃除の役目', async (t) => {
+  it('meta は期限切れでも削除しない(副作用なし)。削除は consume / 掃除の役目', async (t) => {
     const h = await startHarness(t);
     const expired = await createSecret(h, { [HEADER_TTL]: '60' });
     h.advanceClock(61_000);
@@ -511,7 +627,7 @@ describe('GET /api/payload/:id/meta', () => {
     assert.equal(h.store.stats.length, 0);
   });
 
-  it('GET 以外のメソッドは 405（Allow: GET）で、ストアに触れない', async (t) => {
+  it('GET 以外のメソッドは 405(Allow: GET)で、ストアに触れない', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
 
@@ -526,7 +642,7 @@ describe('GET /api/payload/:id/meta', () => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/payload/:id/consume  （消費: 1 回読み切り・即時削除）
+// POST /api/payload/:id/consume  (消費: 1 回読み切り・即時削除)
 // ---------------------------------------------------------------------------
 
 describe('POST /api/payload/:id/consume', () => {
@@ -535,7 +651,7 @@ describe('POST /api/payload/:id/consume', () => {
     const secret = await createSecret(h);
     assert.equal(h.store.size, 1);
 
-    const response = await consume(h, secret.id);
+    const response = await consume(h, secret);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('content-type'), 'application/octet-stream');
     assert.equal(response.headers.get(HEADER_IV), Buffer.from(secret.iv).toString('base64url'));
@@ -550,18 +666,18 @@ describe('POST /api/payload/:id/consume', () => {
     const secret = await createSecret(h, { [HEADER_TYPE]: 'file' });
 
     assert.equal((await getMeta(h, secret.id)).status, 200);
-    assert.equal((await consume(h, secret.id)).status, 200);
+    assert.equal((await consume(h, secret)).status, 200);
     assert.equal((await getMeta(h, secret.id)).status, 404, '消費後は meta でも存在しない');
-    assert.equal((await consume(h, secret.id)).status, 404);
+    assert.equal((await consume(h, secret)).status, 404);
   });
 
   it('2 回目は 404。一度も発行されていない ID と全く同じレスポンスで、区別できない', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
-    await consume(h, secret.id);
+    await consume(h, secret);
 
-    const consumed = await consume(h, secret.id);
-    const neverIssued = await consume(h, randomBytes(16).toString('base64url'));
+    const consumed = await consume(h, secret);
+    const neverIssued = await consume(h, unknownSecret(randomBytes(16).toString('base64url')));
 
     for (const response of [consumed, neverIssued]) {
       assert.equal(response.status, 404);
@@ -576,7 +692,7 @@ describe('POST /api/payload/:id/consume', () => {
     const secret = await createSecret(h);
 
     let responded = false;
-    const pending = consume(h, secret.id).then((response) => {
+    const pending = consume(h, secret).then((response) => {
       responded = true;
       return response;
     });
@@ -586,7 +702,7 @@ describe('POST /api/payload/:id/consume', () => {
     await sleep(50);
     assert.equal(responded, false, '削除が終わっても、take() が返るまではレスポンスを書き出さない');
 
-    h.store.release.resolve();
+    h.store.releaseGate.resolve();
     const response = await pending;
     assert.equal(response.status, 200);
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), secret.ciphertext);
@@ -596,7 +712,7 @@ describe('POST /api/payload/:id/consume', () => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
 
-    const responses = await Promise.all(Array.from({ length: 50 }, () => consume(h, secret.id)));
+    const responses = await Promise.all(Array.from({ length: 50 }, () => consume(h, secret)));
     const statuses = responses.map((r) => r.status);
     assert.equal(statuses.filter((s) => s === 200).length, 1);
     assert.equal(statuses.filter((s) => s === 404).length, 49);
@@ -611,9 +727,9 @@ describe('POST /api/payload/:id/consume', () => {
     const alive = await createSecret(h, { [HEADER_TTL]: '3600' });
 
     h.advanceClock(61_000);
-    assert.equal((await consume(h, expired.id)).status, 404);
+    assert.equal((await consume(h, expired)).status, 404);
     assert.equal(h.store.size, 1, '期限切れ分は consume の試行でも削除される');
-    assert.equal((await consume(h, alive.id)).status, 200);
+    assert.equal((await consume(h, alive)).status, 200);
   });
 
   it('クエリ付きのリクエストは 400 で拒否し、暗号文は消費しない', async (t) => {
@@ -625,30 +741,87 @@ describe('POST /api/payload/:id/consume', () => {
     assert.deepEqual(await response.json(), { error: 'query_not_allowed' });
     assert.equal(h.store.takes.length, 0);
 
-    assert.equal((await consume(h, secret.id)).status, 200, '正しいリクエストではまだ取得できる');
+    assert.equal((await consume(h, secret)).status, 200, '正しいリクエストではまだ取得できる');
   });
 
-  it('POST 以外のメソッド（GET・HEAD・PUT・DELETE・PATCH・OPTIONS）は 405 で、暗号文を消費しない', async (t) => {
+  it('POST 以外のメソッド(GET・HEAD・PUT・DELETE・PATCH・OPTIONS)は 405 で、暗号文を消費しない', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
 
     for (const method of ['GET', 'HEAD', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']) {
-      const response = await consume(h, secret.id, { method });
+      const response = await consume(h, secret, { method });
       assert.equal(response.status, 405, method);
       assert.equal(response.headers.get('allow'), 'POST');
       assert.notEqual(response.headers.get('content-type'), 'application/octet-stream', '本体は返らない');
     }
     assert.equal(h.store.takes.length, 0, 'ストアには一切触れていない');
-    assert.equal((await consume(h, secret.id)).status, 200);
+    assert.equal((await consume(h, secret)).status, 200);
+  });
+});
+
+describe('POST /api/payload/:id/consume: 消費用秘密鍵(X-CipherDrop-Consume-Secret、必須)', () => {
+  it('ヘッダーが無いと 404(ID は正しいのに、秘密鍵が無いだけで「存在しない」と全く同じ応答になる)', async (t) => {
+    const h = await startHarness(t);
+    const secret = await createSecret(h);
+
+    const response = await consume(h, secret, { headers: { [HEADER_CONSUME_SECRET]: undefined } });
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: 'not_found' });
+    assert.equal(h.store.size, 1, '削除されていない');
+
+    assert.equal((await consume(h, secret)).status, 200, '正しい秘密鍵なら、その後もまだ取得できる');
+  });
+
+  for (const bad of ['short', 'A'.repeat(42), 'A'.repeat(44), `${'A'.repeat(41)}+/`, '']) {
+    it(`形式が不正 (${JSON.stringify(bad)}) だと 404 で、削除されない`, async (t) => {
+      const h = await startHarness(t);
+      const secret = await createSecret(h);
+
+      const response = await consume(h, secret, { headers: { [HEADER_CONSUME_SECRET]: bad } });
+      assert.equal(response.status, 404);
+      assert.equal(h.store.size, 1, '削除されていない');
+    });
+  }
+
+  it('ID だけを知っていても、正しい consumeSecret を知らなければ取得できない(構造的な権限分離の核心)', async (t) => {
+    const h = await startHarness(t);
+    const secret = await createSecret(h);
+
+    // ID(secret.id)は URL パスに載るため、サーバーログ・ブラウザ履歴などから漏れ得る。
+    // しかし consumeSecret は共有 URL のハッシュ断片にしかなく、これを知らない限り破棄できないことを確認する。
+    const response = await consume(h, unknownSecret(secret.id));
+    assert.equal(response.status, 404);
+    assert.equal(h.store.size, 1, '誤った秘密鍵では削除されない');
+
+    assert.equal((await consume(h, secret)).status, 200, '正しい秘密鍵ならその後も取得できる');
+  });
+
+  it('秘密鍵の間違い・未発行の ID・期限切れは、すべて同じ 404(ステータス・ヘッダー・本文まで区別できない)', async (t) => {
+    const h = await startHarness(t);
+    const wrongSecretCase = await createSecret(h);
+    const expired = await createSecret(h, { [HEADER_TTL]: '60' });
+    h.advanceClock(61_000);
+
+    const wrongSecret = await consume(h, unknownSecret(wrongSecretCase.id)); // 秘密鍵が違う
+    const neverIssued = await consume(h, unknownSecret(randomBytes(16).toString('base64url'))); // 未発行の ID
+    const expiredResponse = await consume(h, expired); // 期限切れ(秘密鍵自体は正しい)
+
+    for (const response of [wrongSecret, neverIssued, expiredResponse]) {
+      assert.equal(response.status, 404);
+      assert.deepEqual(await response.clone().json(), { error: 'not_found' });
+    }
+    const comparable = (r: Response) => [r.status, r.headers.get('content-length'), r.headers.get('content-type'), r.headers.get('cache-control')];
+    assert.deepEqual(comparable(wrongSecret), comparable(neverIssued));
+    assert.deepEqual(comparable(neverIssued), comparable(expiredResponse));
   });
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/payload/ping （ヘルスチェック。Docker HEALTHCHECK が叩く）
+// GET /api/payload/ping (ヘルスチェック。Docker HEALTHCHECK が叩く)
 // ---------------------------------------------------------------------------
 
 describe('GET /api/payload/ping', () => {
-  it('200 {"status":"ok"} を返す。ストアには一切触れない（stat も take も呼ばない）', async (t) => {
+  it('200 {"status":"ok"} を返す。ストアには一切触れない(stat も take も呼ばない)', async (t) => {
     const h = await startHarness(t);
     await createSecret(h); // ストアに何か入っていても、無関係に応答することを確認する
 
@@ -660,7 +833,7 @@ describe('GET /api/payload/ping', () => {
     assert.equal(h.store.size, 1, 'ping の前後でストアの中身は変わらない');
   });
 
-  it('何度呼んでも同じ応答（副作用が無いことを繰り返しで確認する）', async (t) => {
+  it('何度呼んでも同じ応答(副作用が無いことを繰り返しで確認する)', async (t) => {
     const h = await startHarness(t);
     const responses = await Promise.all(Array.from({ length: 50 }, () => fetch(`${h.baseUrl}/api/payload/ping`)));
     for (const response of responses) {
@@ -671,7 +844,7 @@ describe('GET /api/payload/ping', () => {
     assert.equal(h.store.takes.length, 0);
   });
 
-  it('GET 以外は 405（Allow: GET）', async (t) => {
+  it('GET 以外は 405(Allow: GET)', async (t) => {
     const h = await startHarness(t);
     for (const method of ['POST', 'HEAD', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']) {
       const response = await fetch(`${h.baseUrl}/api/payload/ping`, { method });
@@ -680,14 +853,14 @@ describe('GET /api/payload/ping', () => {
     }
   });
 
-  it('クエリ付きは 400 で拒否する（他のエンドポイントと同じ規則）', async (t) => {
+  it('クエリ付きは 400 で拒否する(他のエンドポイントと同じ規則)', async (t) => {
     const h = await startHarness(t);
     const response = await fetch(`${h.baseUrl}/api/payload/ping?x=1`);
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: 'query_not_allowed' });
   });
 
-  it('22 文字の ID と衝突しない（"ping" は ID の形式・長さに一致しない）', () => {
+  it('22 文字の ID と衝突しない("ping" は ID の形式・長さに一致しない)', () => {
     assert.notEqual('ping'.length, 22);
     assert.doesNotMatch('ping', /^[A-Za-z0-9_-]{22}$/);
   });
@@ -703,8 +876,8 @@ describe('リンクプレビュー・クローラー・疎通確認が何を叩�
     const secret = await createSecret(h);
     const item = `${h.baseUrl}/api/payload/${secret.id}`;
 
-    // 実在のボットが行いそうなアクセスをすべて試す（旧仕様の GET /api/payload/:id を含む）。
-    // 期待するのは「GET /meta だけが 200（メタ情報）で、それ以外は本体を返さない 404 / 405」。
+    // 実在のボットが行いそうなアクセスをすべて試す(旧仕様の GET /api/payload/:id を含む)。
+    // 期待するのは「GET /meta だけが 200(メタ情報)で、それ以外は本体を返さない 404 / 405」。
     const botRequests: Array<{ method: string; suffix: string; expected: number }> = [];
     for (const method of ['GET', 'HEAD', 'OPTIONS', 'DELETE', 'PUT', 'PATCH', 'POST']) {
       botRequests.push({ method, suffix: '', expected: 404 }); // 旧 URL は廃止
@@ -722,12 +895,12 @@ describe('リンクプレビュー・クローラー・疎通確認が何を叩�
     assert.equal(h.store.takes.length, 0, 'GET 系・HEAD 等では一度も take() が呼ばれていない');
     assert.equal(h.store.size, 1);
 
-    // 受信者が明示的に開いたとき（POST consume）だけ取得できる
-    const consumed = await consume(h, secret.id);
+    // 受信者が明示的に開いたとき(POST consume)だけ取得できる
+    const consumed = await consume(h, secret);
     assert.equal(consumed.status, 200);
     assert.deepEqual(new Uint8Array(await consumed.arrayBuffer()), secret.ciphertext);
     assert.equal(h.store.takes.length, 1);
-    assert.equal((await consume(h, secret.id)).status, 404);
+    assert.equal((await consume(h, secret)).status, 404);
   });
 
   it('旧仕様の GET /api/payload/:id は廃止されており、どのメソッドでも 404 で本体を返さない', async (t) => {
@@ -743,7 +916,7 @@ describe('リンクプレビュー・クローラー・疎通確認が何を叩�
     assert.equal(h.store.stats.length, 0);
   });
 
-  it('GET /consume は本体を返さず 405（メタ確認だけなら GET /meta を使う）', async (t) => {
+  it('GET /consume は本体を返さず 405(メタ確認だけなら GET /meta を使う)', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h);
 
@@ -759,7 +932,7 @@ describe('リンクプレビュー・クローラー・疎通確認が何を叩�
 // ---------------------------------------------------------------------------
 
 describe('ID・パスの検証', () => {
-  it('形式の正しくない ID・パスは、ストアに触れず 404（または 400）', async (t) => {
+  it('形式の正しくない ID・パスは、ストアに触れず 404(または 400)', async (t) => {
     const h = await startHarness(t);
     const valid = randomBytes(16).toString('base64url');
 
@@ -772,7 +945,7 @@ describe('ID・パスの検証', () => {
     ];
     for (const id of viaFetch) {
       assert.equal((await getMeta(h, id)).status, 404, `meta ${id}`);
-      assert.equal((await consume(h, id)).status, 404, `consume ${id}`);
+      assert.equal((await consume(h, unknownSecret(id))).status, 404, `consume ${id}`);
     }
 
     // fetch は URL を正規化してしまうため、生の TCP で送る
@@ -782,7 +955,7 @@ describe('ID・パスの検証', () => {
       ['POST', `/api/payload/%41${valid.slice(3)}/consume`],
       ['GET', `/api/payload//${valid}/meta`],
       ['GET', `/api/payload/${valid}/meta#fragment`],
-      ['GET', `/api/payload/${valid}/META`], // 大文字は別ルート（存在しない）
+      ['GET', `/api/payload/${valid}/META`], // 大文字は別ルート(存在しない)
       ['GET', `/api/payload/${valid}/meta/`], // 末尾スラッシュ
       ['POST', `/api/payload/${valid}/consume/extra`],
       ['POST', `/api/payload/${valid}/`],
@@ -811,9 +984,9 @@ describe('レスポンスヘッダー', () => {
     const responses = [
       await postPayload(h), // 201
       await postPayload(h, makeUpload(), { 'content-type': 'text/plain' }), // 415
-      await getMeta(h, secret.id), // 200（JSON）
-      await consume(h, secret.id), // 200（バイナリ）
-      await consume(h, secret.id), // 404
+      await getMeta(h, secret.id), // 200(JSON)
+      await consume(h, secret), // 200(バイナリ)
+      await consume(h, secret), // 404
       await getMeta(h, secret.id), // 404
       await fetch(`${h.baseUrl}/nope`), // 404
       await fetch(`${h.baseUrl}/api/payload`, { method: 'OPTIONS', headers: { origin: 'https://evil.example' } }), // 405
@@ -827,19 +1000,19 @@ describe('レスポンスヘッダー', () => {
       assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'");
       assert.equal(response.headers.get('cross-origin-resource-policy'), 'same-origin');
       assert.equal(response.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains; preload');
-      assert.equal(response.headers.get('access-control-allow-origin'), null, 'CORS は許可しない（同一オリジン運用）');
+      assert.equal(response.headers.get('access-control-allow-origin'), null, 'CORS は許可しない(同一オリジン運用)');
       await response.arrayBuffer();
     }
   });
 });
 
 describe('ログ', () => {
-  it('固定スキーマのイベントだけを出し、ID・IV・暗号文・URL・クエリを一切含まない', async (t) => {
+  it('固定スキーマのイベントだけを出し、ID・IV・暗号文・消費用秘密鍵・URL・クエリを一切含まない', async (t) => {
     const h = await startHarness(t);
     const secret = await createSecret(h, { [HEADER_TYPE]: 'file' });
     await getMeta(h, secret.id);
-    await consume(h, secret.id);
-    await consume(h, secret.id); // 404
+    await consume(h, secret);
+    await consume(h, secret); // 404
     await getMeta(h, secret.id); // 404
     await fetch(`${h.baseUrl}/api/payload/${secret.id}/meta?key=QUERYSECRET`); // 400
     await fetch(`${h.baseUrl}/no/such/path`);
@@ -872,6 +1045,8 @@ describe('ログ', () => {
       Buffer.from(secret.ciphertext).toString('base64'),
       Buffer.from(secret.ciphertext).toString('base64url'),
       Buffer.from(secret.ciphertext).toString('hex'),
+      Buffer.from(secret.consumeSecret).toString('base64url'),
+      verifierHeaderOf(secret.consumeSecret),
       '/api/payload',
       'QUERYSECRET',
       'key=',

@@ -223,6 +223,47 @@ describe('deploy/nginx.conf: 非 root・8080 番での静的配信 + /api 中継
   });
 });
 
+describe('deploy/nginx.conf: DoS 対策（接続数・リクエスト頻度の制限、低速接続のタイムアウト）', () => {
+  it('IP単位の接続数制限（limit_conn_zone）とリクエスト頻度制限（limit_req_zone）を、$binary_remote_addr で定義している', () => {
+    assert.match(nginxConf, /limit_conn_zone\s+\$binary_remote_addr\s+zone=\w+:\d+[kKmMgG];/);
+    assert.match(nginxConf, /limit_req_zone\s+\$binary_remote_addr\s+zone=\w+:\d+[kKmMgG]\s+rate=\d+r\/[sm];/);
+  });
+
+  it('定義したゾーンを、実際に limit_conn / limit_req で適用している（定義しただけで使わない抜けを防ぐ）', () => {
+    const connZone = /limit_conn_zone\s+\$binary_remote_addr\s+zone=(\w+):/.exec(nginxConf)?.[1];
+    const reqZone = /limit_req_zone\s+\$binary_remote_addr\s+zone=(\w+):/.exec(nginxConf)?.[1];
+    assert.ok(connZone, 'limit_conn_zone のゾーン名を読み取れること');
+    assert.ok(reqZone, 'limit_req_zone のゾーン名を読み取れること');
+    assert.match(nginxConf, new RegExp(`limit_conn\\s+${connZone}\\s+\\d+;`), 'limit_conn_zone を定義したゾーンが limit_conn で使われていない');
+    assert.match(nginxConf, new RegExp(`limit_req\\s+zone=${reqZone}\\b`), 'limit_req_zone を定義したゾーンが limit_req で使われていない');
+  });
+
+  it('client_body_timeout・send_timeout・client_header_timeout を設定している（Slowloris など低速接続攻撃の自動切断）', () => {
+    assert.match(nginxConf, /client_body_timeout\s+\d+s;/);
+    assert.match(nginxConf, /send_timeout\s+\d+s;/);
+    assert.match(nginxConf, /client_header_timeout\s+\d+s;/);
+  });
+});
+
+describe('deploy/nginx.conf: 安全なアクセスログ（ペイロード ID を含む URI・クエリ文字列を記録しない）', () => {
+  it('log_format の中身に、URI・クエリ文字列を含む変数を使っていない', () => {
+    const format = /log_format\s+\w+\s+([\s\S]*?);/.exec(nginxConf)?.[1] ?? '';
+    assert.ok(format.length > 0, 'log_format が見つからない');
+    for (const variable of ['$request_uri', '$query_string', '$args', '$uri', '$document_uri']) {
+      assert.equal(format.includes(variable), false, `${variable} を log_format に含めてはならない（ペイロード ID が残る）`);
+    }
+    // $request は "METHOD URI HTTP/x.x" の結合（URI を含む）。$request_method・$request_time とは別物として
+    // 明示的に除外する（前方一致で $request_method 等まで拾ってしまわないよう、後続に識別子が無い場合だけ検出する）。
+    assert.doesNotMatch(format, /\$request(?![A-Za-z_])/, '$request（URI を含む）を log_format に含めてはならない');
+  });
+
+  it('カスタムした log_format を、実際に access_log で使っている（定義しただけで既定の combined のままという抜けを防ぐ）', () => {
+    const formatName = /log_format\s+(\w+)\s/.exec(nginxConf)?.[1];
+    assert.ok(formatName, 'log_format の名前を読み取れること');
+    assert.match(nginxConf, new RegExp(`access_log\\s+\\S+\\s+${formatName};`), `access_log が ${formatName} を指定していない`);
+  });
+});
+
 describe('deploy/security-headers.conf: エンタープライズ基準のヘッダー', () => {
   it('HSTS・nosniff・DENY・no-referrer・CSP のすべてを、always 付きで指定している', () => {
     const expected: Array<[string, RegExp]> = [
