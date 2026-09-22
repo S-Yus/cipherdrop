@@ -2,19 +2,25 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ApiError } from '../api.ts';
 import { mountApp } from '../app.ts';
-import { encryptData, encryptFile } from '../crypto.ts';
+import { encryptData, encryptFile, generateKeyCheckTag } from '../crypto.ts';
 import type { EncryptedPayload } from '../crypto.ts';
 import { SAMPLE_ID, click, createTestEnv, has, meta, query, waitFor } from '../testing/env.ts';
 import type { ApiCall, TestEnvOptions } from '../testing/env.ts';
 
-/** 受取画面を開く。sealed の暗号文を返す API を用意し、鍵は sealed のものをリンクに載せる（key で上書き可）。 */
-function open(sealed: EncryptedPayload, options: { type?: 'text' | 'file'; key?: string; path?: string; env?: TestEnvOptions } = {}) {
+/**
+ * 受取画面を開く。sealed の暗号文を返す API を用意し、鍵は sealed のものをリンクに載せる（key で上書き可）。
+ * keyCheck を渡すと meta 応答に含める（省略時は、これまでどおり keyCheck を含めない＝後方互換のケース）。
+ */
+function open(sealed: EncryptedPayload, options: { type?: 'text' | 'file'; key?: string; path?: string; keyCheck?: string; env?: TestEnvOptions } = {}) {
   const type = options.type ?? 'text';
   const key = options.key ?? sealed.keyString;
   const t = createTestEnv({
     url: `https://cipherdrop.io${options.path ?? `/v/${SAMPLE_ID}`}${key === '' ? '' : `#${key}`}`,
     api: {
-      getMeta: async () => meta(type, sealed.encryptedData.byteLength),
+      getMeta: async () => ({
+        ...meta(type, sealed.encryptedData.byteLength),
+        ...(options.keyCheck === undefined ? {} : { keyCheck: options.keyCheck }),
+      }),
       consume: async () => ({ encryptedData: sealed.encryptedData, iv: sealed.iv }),
     },
     ...options.env,
@@ -303,6 +309,58 @@ describe('受取画面: 不完全なリンクは、消費する前に止める�
     const t = open(sealed, { path: '/v/short' });
     assert.match(t.main.textContent ?? '', /リンクが不正です/);
     assert.equal(t.calls.length, 0);
+  });
+});
+
+describe('受取画面: 鍵確認値（形式は正しいが内容が違う鍵を、消費する前に止める）', () => {
+  it('meta.keyCheck とローカルで計算した値が不一致なら「鍵が一致しません」。「開く」ボタンを出さず、consume は一度も呼ばない', async () => {
+    const sealed = await encryptData('鍵確認ミスマッチの本文');
+    const t = open(sealed, { keyCheck: '00000000' });
+    await waitFor(() => /鍵が一致しません/.test(t.main.textContent ?? ''));
+
+    assert.match(t.main.textContent ?? '', /共有リンクの復号鍵が正しくないか、途中で切れています/);
+    assert.match(t.main.textContent ?? '', /正しい URL を確認してください/);
+    assert.equal(has(t.main, '[data-action="open"]'), false, '「開く」ボタンを描画しない');
+    assert.deepEqual(methods(t), ['getMeta'], 'consume は一度も呼ばれない（meta の確認だけ）');
+  });
+
+  it('不一致のエラーは、赤く塗りつぶさない静かな表示（border-red-500/20 bg-red-500/5）で、再試行ボタンを持たない', async () => {
+    const t = open(await encryptData('x'), { keyCheck: 'ffffffff' });
+    await waitFor(() => /鍵が一致しません/.test(t.main.textContent ?? ''));
+
+    const alert = query(t.main, '[role="alert"]');
+    assert.ok(alert.classList.contains('border-red-500/20') && alert.classList.contains('bg-red-500/5'));
+    assert.equal(has(t.main, '[data-action="retry"]'), false, 'URL 自体が誤っているので、再試行しても直らない');
+    assert.equal(has(t.main, 'button'), false, '操作できるボタンを 1 つも置かない');
+  });
+
+  it('一致すれば、通常どおり確認画面から開ける（誤検出で正しいデータへの到達を妨げない）', async () => {
+    const sealed = await encryptData('鍵確認一致の本文');
+    const correctTag = await generateKeyCheckTag(sealed.keyString);
+    const t = open(sealed, { keyCheck: correctTag });
+    await waitFor(() => has(t.main, '[data-action="open"]'));
+
+    click(openButton(t));
+    const output = await waitFor(() => t.main.querySelector('[data-testid="decrypted-text"]'));
+    assert.equal(output.textContent, '鍵確認一致の本文');
+    assert.deepEqual(methods(t), ['getMeta', 'consume']);
+  });
+
+  it('meta に keyCheck が無い（旧データ・未対応の送信側）なら、従来どおり確認画面が出る（後方互換）', async () => {
+    const sealed = await encryptData('x');
+    const t = open(sealed); // keyCheck を指定しない＝これまでの meta() と同じ
+    await waitFor(() => has(t.main, '[data-action="open"]'));
+    assert.equal(has(t.main, '[role="alert"]'), false);
+  });
+
+  it('ファイルでも同様に、不一致ならダウンロードせず止める', async () => {
+    const sealed = await encryptFile({ name: '見積書.pdf', data: new ArrayBuffer(16) });
+    const t = open(sealed, { type: 'file', keyCheck: '12345678' });
+    await waitFor(() => /鍵が一致しません/.test(t.main.textContent ?? ''));
+
+    assert.equal(t.saved.length, 0, 'ダウンロードは発生しない');
+    assert.doesNotMatch(t.main.textContent ?? '', /見積書/, '確認前のファイル名は画面に出ない');
+    assert.deepEqual(methods(t), ['getMeta']);
   });
 });
 

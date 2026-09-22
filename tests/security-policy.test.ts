@@ -266,8 +266,11 @@ describe('セキュリティポリシー: 2 段階消費（副作用のある操
     assert.deepEqual(functionsCalling(backend('server.ts'), 'take'), ['consumePayload']);
   });
 
-  it('メタ情報の型 PayloadMeta は type / size / expiresAt だけ。暗号文・IV を持てない', () => {
-    assert.deepEqual(interfaceMembers(backend('store.ts'), 'PayloadMeta').sort(), ['expiresAt', 'size', 'type']);
+  it('メタ情報の型 PayloadMeta は type / size / expiresAt / keyCheck（任意）だけ。暗号文・IV を持てない', () => {
+    const members = interfaceMembers(backend('store.ts'), 'PayloadMeta');
+    assert.deepEqual(members.sort(), ['expiresAt', 'keyCheck', 'size', 'type']);
+    // keyCheck を足す変更でも、この 2 つ（本来の暗号文・IV）だけは増えていないことを独立に確認する。
+    assert.deepEqual(members.filter((name) => name === 'ciphertext' || name === 'iv'), [], '暗号文・IV を持たないこと');
   });
 
   it('メタ確認のハンドラ readMeta は、暗号文・IV を参照しない', () => {

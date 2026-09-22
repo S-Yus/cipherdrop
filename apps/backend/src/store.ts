@@ -1,8 +1,9 @@
 /**
  * 暗号文ストア。
  *
- * サーバーが保持してよいのは「暗号文・IV・有効期限・表示用の種別ヒント」だけ。
- * 平文も鍵も、このプロセスには存在しない。
+ * サーバーが保持してよいのは「暗号文・IV・有効期限・表示用の種別ヒント・鍵確認値（任意）」だけ。
+ * 平文も鍵そのものも、このプロセスには存在しない
+ * （鍵確認値は鍵から一方向に導出した 32bit のヒントで、鍵は復元できない。crypto.ts 参照）。
  *
  * 暗号文がストアの外へ出る経路は take()（取得と削除が不可分）だけにしている。
  * 「削除せずに暗号文を読む」get() を用意しないことで、1 回読み切り（Self-Destruct）を
@@ -23,6 +24,12 @@ export interface StoredPayload {
   ciphertext: Uint8Array;
   iv: Uint8Array;
   type: PayloadType;
+  /**
+   * 鍵確認値（16進小文字 8 桁、任意）。共有リンクのコピペミス・途中欠損を受信側で検出するためのヒントで、
+   * 暗号強度には寄与しない（クライアントが鍵から一方向に導出した値。詳細は crypto.ts の generateKeyCheckTag）。
+   * 省略された場合（旧データ・未対応の送信側）は保存しない。
+   */
+  keyCheck?: string;
 }
 
 /** 暗号文の中身に触れずに公開してよい情報だけ。暗号文・IV は含めない。 */
@@ -32,6 +39,8 @@ export interface PayloadMeta {
   size: number;
   /** 有効期限（epoch ms）。 */
   expiresAt: number;
+  /** 鍵確認値（任意）。StoredPayload.keyCheck 参照。 */
+  keyCheck?: string;
 }
 
 export interface PayloadStore {
@@ -117,7 +126,11 @@ export class InMemoryPayloadStore implements PayloadStore {
     // 読み取り専用。期限切れでもここでは削除しない（削除は take / purgeExpired / put の役目）。
     const entry = this.#entries.get(id);
     if (entry === undefined || entry.expiresAt <= this.#now()) return null;
-    return { type: entry.payload.type, size: entry.payload.ciphertext.byteLength, expiresAt: entry.expiresAt };
+    const { type, ciphertext, keyCheck } = entry.payload;
+    // keyCheck が無い保存分は、戻り値にもキー自体を持たせない（後方互換を型のレベルでも保つ）。
+    return keyCheck === undefined
+      ? { type, size: ciphertext.byteLength, expiresAt: entry.expiresAt }
+      : { type, size: ciphertext.byteLength, expiresAt: entry.expiresAt, keyCheck };
   }
 
   async take(id: string): Promise<StoredPayload | null> {

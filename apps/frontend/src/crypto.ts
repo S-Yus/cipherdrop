@@ -30,6 +30,11 @@ const FORMAT_FILE = 0x03;
 /** ファイル名（UTF-8）の最大バイト数。送信側・受信側の両方で強制する。 */
 const MAX_FILE_NAME_BYTES = 1024;
 
+/** 鍵確認値のドメイン分離文字列。アルゴリズムを変える場合は新しい接頭辞にする（既存の値と衝突させない）。 */
+const KEY_CHECK_DOMAIN = 'cipherdrop-key-check-v1:';
+/** 鍵確認値の長さ（16進の桁数）。SHA-256 の先頭 32bit。 */
+const KEY_CHECK_HEX_DIGITS = 8;
+
 export type CryptoErrorCode =
   | 'WEBCRYPTO_UNAVAILABLE'
   | 'INVALID_PAYLOAD'
@@ -283,6 +288,37 @@ function decodeKeyString(keyString: string): Uint8Array<ArrayBuffer> {
     throw new CipherDropCryptoError('INVALID_KEY', 'Key must be a base64url string encoding 256 bits.');
   }
   return raw;
+}
+
+/** 鍵確認値の形式（SHA-256 の先頭 32bit、16進小文字 8 桁）。api.ts がサーバー応答の検証に使う。 */
+export const KEY_CHECK_PATTERN = /^[0-9a-f]{8}$/;
+
+/**
+ * 鍵確認値（Key Check Tag）: 共有リンクのコピペミス・途中欠損を、消費する前に検出するための短いタグ。
+ * 秘匿のためではない。 `SHA-256(ドメイン分離文字列 + 鍵)` の先頭 32bit（16進小文字 8 桁）。
+ *
+ * - **一方向性**: この値から鍵は復元できない。32bit まで絞り込んでも、残り 224bit の全数探索は
+ *   非現実的なので、鍵の総当たりを実用的に助けることはない。
+ * - **ドメイン分離**: 固定の接頭辞（cipherdrop-key-check-v1:）を混ぜているので、この値が他の用途の
+ *   ハッシュと衝突・混同しない。
+ * - **絶対遵守ルール「復号鍵はサーバーに送らない」への例外ではない**: サーバーへ送るのは鍵そのもの
+ *   ではなく、鍵の一方向関数の出力の一部（32bit）だけ。ただし、サーバーが鍵について一切の情報を
+ *   持たないという意味の完全なゼロ知識ではなくなる、という点は意図した・限定的なトレードオフ
+ *   （README「信頼モデルと既知の制約」参照）。
+ *
+ * @param keyStr 確認値を計算したい鍵の文字列。形式は検証しない（受取画面では isValidKeyString の後に呼ぶ）。
+ */
+export async function generateKeyCheckTag(keyStr: string): Promise<string> {
+  const subtle = getSubtle();
+  const bytes = new TextEncoder().encode(`${KEY_CHECK_DOMAIN}${keyStr}`);
+  const digest = new Uint8Array(await subtle.digest('SHA-256', bytes));
+  return toHex(digest.subarray(0, KEY_CHECK_HEX_DIGITS / 2));
+}
+
+function toHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+  return hex;
 }
 
 /** RFC 4648 §5 の base64url（パディング無し）。IV を HTTP ヘッダーで受け渡すときにも使う。 */

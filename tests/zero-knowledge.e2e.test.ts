@@ -13,8 +13,8 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { describe, it } from 'node:test';
-import { HEADER_IV, HEADER_TYPE } from '../apps/backend/src/server.ts';
-import { CipherDropCryptoError, base64UrlDecode, base64UrlEncode, decryptData, encryptData } from '../apps/frontend/src/crypto.ts';
+import { HEADER_IV, HEADER_KEY_CHECK, HEADER_TYPE } from '../apps/backend/src/server.ts';
+import { CipherDropCryptoError, base64UrlDecode, base64UrlEncode, decryptData, encryptData, generateKeyCheckTag } from '../apps/frontend/src/crypto.ts';
 import { RecordingStore, leakedForms, parseHttpRequests, startWorld } from './support/world.ts';
 
 const SHARE_ORIGIN = 'https://cipherdrop.io';
@@ -23,9 +23,10 @@ const SHARE_ORIGIN = 'https://cipherdrop.io';
 // 利用サンプル: 送信者と受信者のブラウザが行う処理
 // ---------------------------------------------------------------------------
 
-/** 送信者: 暗号化 → 暗号文と IV（と種別ヒント）だけを送信 → 共有 URL（鍵は # 以降）を組み立てる。 */
+/** 送信者: 暗号化 → 暗号文・IV・鍵確認値だけを送信 → 共有 URL（鍵は # 以降）を組み立てる。 */
 async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Promise<string> {
   const { encryptedData, iv, keyString } = await encryptData(payload);
+  const keyCheck = await generateKeyCheckTag(keyString); // 鍵から一方向に導出した短いタグ（鍵そのものではない）
 
   const response = await fetch(`${apiOrigin}/api/payload`, {
     method: 'POST',
@@ -33,6 +34,7 @@ async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Pro
       'content-type': 'application/octet-stream',
       [HEADER_IV]: base64UrlEncode(iv),
       [HEADER_TYPE]: typeof payload === 'string' ? 'text' : 'file', // 確認画面の表示用ヒント（暗号化されない）
+      [HEADER_KEY_CHECK]: keyCheck,
     },
     body: encryptedData,
   });
@@ -47,6 +49,10 @@ async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Pro
  *   Stage 1 確認  … GET  /meta     ページ読み込み時。何も消費しない
  *   Stage 2 消費  … POST /consume  受信者が「開く」を押したときだけ。返す前にサーバー側で削除される
  * フラグメントを付けたまま fetch に渡しても、ブラウザと同様に HTTP リクエストへは載らない。
+ *
+ * 簡略化のため、ここでは meta.keyCheck の照合はしない（その安全機構は views/receive.ts の
+ * 実装対象で、receive.test.ts / ui-flow.e2e.test.ts が検証している）。この関数は 2 段階 API 自体の
+ * 利用例に絞っている。
  */
 async function receiveSecret(apiOrigin: string, shareUrl: string): Promise<string | ArrayBuffer> {
   const link = new URL(shareUrl);
@@ -132,9 +138,12 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     assert.deepEqual(new Uint8Array(upload.body), stored.ciphertext, 'アップロード本文は暗号文そのもの');
     assert.equal(upload.headers.get(HEADER_IV), base64UrlEncode(stored.iv), 'IV はヘッダーに現れる');
     assert.equal(upload.headers.get(HEADER_TYPE), 'text', '種別ヒントはヘッダーに現れる（表示専用の情報）');
+    const expectedKeyCheck = await generateKeyCheckTag(keyString);
+    assert.equal(upload.headers.get(HEADER_KEY_CHECK), expectedKeyCheck, '鍵確認値はヘッダーに現れる（鍵ではなく、鍵から導出した 8 桁の値）');
+    assert.equal(stored.keyCheck, expectedKeyCheck, '保存された値も同じ（サーバーは意味を解釈せずそのまま保存する）');
     assert.deepEqual(requests.slice(1).map((r) => r.body.length), [0, 0, 0], '2 件目以降は本文を持たない');
 
-    // --- 通信: 鍵はどんな形でも現れない ---
+    // --- 通信: 鍵はどんな形でも現れない（鍵確認値ヘッダーを含めて検査する）---
     const rawKey = Buffer.from(keyString, 'base64url');
     assert.equal(rawKey.length, 32);
     assert.deepEqual(leakedForms(observed, rawKey, '鍵'), []);
@@ -144,6 +153,9 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     for (let i = 0; i + 12 <= keyString.length; i++) {
       assert.ok(!text.includes(keyString.slice(i, i + 12)), `鍵の一部 (${i}〜) が通信に現れている`);
     }
+    // 上の leakedForms(observed, rawKey, …) は、通信の生バイト列全体（新しい鍵確認値ヘッダーを含む）を
+    // 対象にしている。鍵確認値ヘッダー自体も 32bit・16進 8 桁の短い値で、鍵の符号化ではない。
+    assert.equal(expectedKeyCheck.length, 8);
 
     // --- 通信: 平文もどんな形でも現れない ---
     assert.deepEqual(leakedForms(observed, Buffer.from(message), '平文'), []);
@@ -151,11 +163,11 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
       assert.ok(!observed.includes(fragment), `平文の断片 "${fragment}" が通信に現れている`);
     }
 
-    // --- 保存: サーバーが持っていたのは暗号文・IV・種別ヒントだけで、そこにも鍵・平文はない ---
+    // --- 保存: サーバーが持っていたのは暗号文・IV・種別ヒント・鍵確認値（32bit）だけで、鍵・平文はない ---
     assert.equal(world.store.puts.length, 1);
-    assert.deepEqual(Object.keys(stored).sort(), ['ciphertext', 'iv', 'type']);
+    assert.deepEqual(Object.keys(stored).sort(), ['ciphertext', 'iv', 'keyCheck', 'type']);
     assert.equal(stored.type, 'text');
-    const storedBytes = Buffer.concat([stored.ciphertext, stored.iv]);
+    const storedBytes = Buffer.concat([stored.ciphertext, stored.iv, Buffer.from(stored.keyCheck ?? '', 'utf8')]);
     assert.deepEqual(leakedForms(storedBytes, rawKey, '鍵'), []);
     assert.deepEqual(leakedForms(storedBytes, Buffer.from(message), '平文'), []);
 

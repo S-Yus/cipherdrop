@@ -7,15 +7,19 @@
  *
  * - 復号鍵はこのモジュールの関数に渡せない（引数に存在しない）。ID も形式を検証するので、`#key` や `?key` を
  *   URL に紛れ込ませることもできない。鍵がサーバーへ送られる経路を、型と検証の両方で塞いでいる。
+ *   createPayload の keyCheck / PayloadMeta.keyCheck は鍵そのものではなく、鍵から一方向に導出した
+ *   短い確認値（crypto.ts の generateKeyCheckTag）。詳細はそちらのコメントを参照。
  * - サーバーは信頼しない相手として扱い、応答はすべて検証する。エラーメッセージは固定文言のみ。
  * - リクエストは Cookie・Referer・キャッシュ・リダイレクトを使わない。
  */
 import { ID_PATTERN } from './router.ts';
-import { base64UrlDecode, base64UrlEncode } from './crypto.ts';
+import { KEY_CHECK_PATTERN, base64UrlDecode, base64UrlEncode } from './crypto.ts';
 
 export const HEADER_IV = 'X-CipherDrop-IV';
 export const HEADER_TTL = 'X-CipherDrop-TTL';
 export const HEADER_TYPE = 'X-CipherDrop-Type';
+/** 鍵確認値（任意）。generateKeyCheckTag（crypto.ts）の出力をそのまま送る。鍵そのものではない。 */
+export const HEADER_KEY_CHECK = 'X-CipherDrop-Key-Check';
 
 export type PayloadType = 'text' | 'file';
 
@@ -25,6 +29,11 @@ export interface PayloadMeta {
   /** 暗号文のバイト数。 */
   size: number;
   expiresAt: Date;
+  /**
+   * 鍵確認値（任意）。無ければキー自体が存在しない（旧データ・送信側が未対応）。
+   * 受取画面はこれと、URL の鍵から計算した値を照合する（views/receive.ts）。
+   */
+  keyCheck?: string;
 }
 
 export type ApiErrorCode =
@@ -62,6 +71,8 @@ export interface ApiClient {
     iv: Uint8Array;
     type: PayloadType;
     ttlSeconds: number;
+    /** 鍵確認値（任意）。省略すると X-CipherDrop-Key-Check ヘッダー自体を送らない。 */
+    keyCheck?: string;
   }): Promise<{ id: string; expiresAt: Date }>;
   getMeta(id: string): Promise<PayloadMeta>;
   consume(id: string): Promise<{ encryptedData: ArrayBuffer; iv: Uint8Array }>;
@@ -102,7 +113,7 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
   }
 
   return {
-    async createPayload({ encryptedData, iv, type, ttlSeconds }) {
+    async createPayload({ encryptedData, iv, type, ttlSeconds, keyCheck }) {
       const response = await request('/api/payload', {
         method: 'POST',
         headers: {
@@ -110,6 +121,8 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
           [HEADER_IV]: base64UrlEncode(iv),
           [HEADER_TYPE]: type,
           [HEADER_TTL]: String(ttlSeconds),
+          // 任意: 省略すればヘッダー自体を送らない（サーバー側も旧クライアントと同じに扱う）。
+          ...(keyCheck === undefined ? {} : { [HEADER_KEY_CHECK]: keyCheck }),
         },
         body: encryptedData,
       });
@@ -127,12 +140,18 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
       const response = await request(`/api/payload/${assertId(id)}/meta`, { method: 'GET' });
 
       const body = await readJson(response);
-      const { type, size } = body;
+      const { type, size, keyCheck } = body;
       const expiresAt = parseDate(body['expiresAt']);
       if ((type !== 'text' && type !== 'file') || !Number.isSafeInteger(size) || (size as number) < 0 || expiresAt === null) {
         throw new ApiError('invalid_response', response.status);
       }
-      return { type, size: size as number, expiresAt };
+      // 任意: 無ければ後方互換（旧データ・未対応の送信側）。有れば厳格に形式を検証する（信頼しない入力）。
+      if (keyCheck !== undefined && (typeof keyCheck !== 'string' || !KEY_CHECK_PATTERN.test(keyCheck))) {
+        throw new ApiError('invalid_response', response.status);
+      }
+      return keyCheck === undefined
+        ? { type, size: size as number, expiresAt }
+        : { type, size: size as number, expiresAt, keyCheck: keyCheck as string };
     },
 
     async consume(id) {

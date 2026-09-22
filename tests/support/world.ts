@@ -19,7 +19,12 @@ export class RecordingStore extends InMemoryPayloadStore {
   readonly takes: string[] = [];
 
   override async put(id: string, payload: StoredPayload, ttlSeconds: number) {
-    this.puts.push({ ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type });
+    // keyCheck が無ければキー自体を持たせない（記録が、実際に保存される形をそのまま映す）。
+    const recorded: StoredPayload =
+      payload.keyCheck === undefined
+        ? { ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type }
+        : { ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type, keyCheck: payload.keyCheck };
+    this.puts.push(recorded);
     return super.put(id, payload, ttlSeconds);
   }
 

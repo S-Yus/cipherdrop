@@ -6,8 +6,14 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_MAX_TTL_SECONDS, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_TTL, HEADER_TYPE } from '../apps/backend/src/server.ts';
-import { HEADER_IV as CLIENT_HEADER_IV, HEADER_TTL as CLIENT_HEADER_TTL, HEADER_TYPE as CLIENT_HEADER_TYPE, createApiClient } from '../apps/frontend/src/api.ts';
+import { DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_MAX_TTL_SECONDS, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_KEY_CHECK, HEADER_TTL, HEADER_TYPE } from '../apps/backend/src/server.ts';
+import {
+  HEADER_IV as CLIENT_HEADER_IV,
+  HEADER_KEY_CHECK as CLIENT_HEADER_KEY_CHECK,
+  HEADER_TTL as CLIENT_HEADER_TTL,
+  HEADER_TYPE as CLIENT_HEADER_TYPE,
+  createApiClient,
+} from '../apps/frontend/src/api.ts';
 import { mountApp } from '../apps/frontend/src/app.ts';
 import { DEFAULT_TTL_SECONDS as UI_DEFAULT_TTL, MAX_UPLOAD_BYTES, TTL_OPTIONS } from '../apps/frontend/src/limits.ts';
 import { click, createTestEnv, dropFiles, has, makeFile, query, typeInto, waitFor } from '../apps/frontend/src/testing/env.ts';
@@ -175,6 +181,35 @@ describe('UI E2E: 不完全なリンク', () => {
   });
 });
 
+describe('UI E2E: 鍵確認値（形式は正しいが内容が違う鍵で、コピペミス・途中欠損を検出する）', () => {
+  it('1 文字だけ違う（が、形式は正しい）鍵では、サーバーへ POST consume を一切送らずに停止する。データは残ったまま', async (t) => {
+    const world = await startWorld(t);
+    const link = await shareText(world, '鍵確認値のテスト本文');
+    const [path = link, key = ''] = link.split('#');
+    // 長さは変えず、先頭の 1 文字だけ別の文字に置き換える（末尾ではないので base64url の正規表現には影響しない）。
+    const corruptedKey = `${key.charAt(0) === 'A' ? 'B' : 'A'}${key.slice(1)}`;
+    const before = parseHttpRequests(world.observedOnWire()).length;
+
+    const receiver = browse(world, `${path}#${corruptedKey}`);
+    await waitFor(() => /鍵が一致しません/.test(receiver.main.textContent ?? ''));
+    assert.equal(has(receiver.main, '[data-action="open"]'), false, '「開く」ボタンを描画しない');
+
+    const requestsAfter = parseHttpRequests(world.observedOnWire());
+    assert.equal(requestsAfter.length, before + 1, 'meta の確認だけは行う（consume は増えない）');
+    assert.equal(requestsAfter.at(-1)?.target.endsWith('/meta'), true);
+    assert.equal(requestsAfter.some((r) => r.target.endsWith('/consume')), false, 'POST consume を一切送らない');
+    assert.equal(world.store.size, 1, 'データは消えていない（誤って消費されていない）');
+    assert.equal(world.store.takes.length, 0);
+
+    // 壊れていない正しいリンクなら、そのまま開ける（データが本当に無事なことの証明）。
+    const proper = browse(world, link);
+    await awaitConfirm(proper);
+    clickOpen(proper);
+    const output = await waitFor(() => proper.main.querySelector('[data-testid="decrypted-text"]'));
+    assert.equal(output.textContent, '鍵確認値のテスト本文');
+  });
+});
+
 describe('UI E2E: ファイルの共有', () => {
   it('ドロップ → 暗号化して送信 → 受信者がダウンロード。名前もバイト列も元どおりで、サーバーには名前が見えない', async (t) => {
     const world = await startWorld(t);
@@ -264,6 +299,7 @@ describe('フロントエンドとバックエンドの契約（定数の整合�
     assert.equal(CLIENT_HEADER_IV.toLowerCase(), HEADER_IV);
     assert.equal(CLIENT_HEADER_TTL.toLowerCase(), HEADER_TTL);
     assert.equal(CLIENT_HEADER_TYPE.toLowerCase(), HEADER_TYPE);
+    assert.equal(CLIENT_HEADER_KEY_CHECK.toLowerCase(), HEADER_KEY_CHECK);
   });
 
   it('画面から見えるページ内の要素は、UI の外へ何も読み込まない（img / script / link / iframe が 0）', async (t) => {

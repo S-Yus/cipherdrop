@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { JSDOM } from 'jsdom';
 import {
@@ -10,6 +10,7 @@ import {
   decryptPayload,
   encryptData,
   encryptFile,
+  generateKeyCheckTag,
   isValidKeyString,
   renderTextSafely,
 } from './crypto.ts';
@@ -404,6 +405,49 @@ describe('isValidKeyString', () => {
     }
     assert.equal(isValidKeyString(undefined as unknown as string), false);
     assert.equal(isValidKeyString(null as unknown as string), false);
+  });
+});
+
+describe('generateKeyCheckTag: 鍵確認値（コピペミス検出用。秘匿性のためではない）', () => {
+  it('同じ鍵からは常に同じ値が得られる。16進小文字 8 桁で、鍵そのものとは異なる文字列', async () => {
+    const { keyString } = await encryptData('x');
+    const first = await generateKeyCheckTag(keyString);
+    const second = await generateKeyCheckTag(keyString);
+
+    assert.equal(first, second);
+    assert.match(first, /^[0-9a-f]{8}$/);
+    assert.notEqual(first, keyString);
+  });
+
+  it('異なる鍵からは異なる値が得られる（200 個で衝突なし）', async () => {
+    const keys = await Promise.all(Array.from({ length: 200 }, async () => (await encryptData('x')).keyString));
+    const tags = await Promise.all(keys.map((key) => generateKeyCheckTag(key)));
+    assert.equal(new Set(tags).size, tags.length);
+  });
+
+  it('1 文字だけ違う鍵（コピペミス・途中欠損の典型）でも、値は一致しない', async () => {
+    const { keyString } = await encryptData('x');
+    const flipped = (keyString.charAt(0) === 'A' ? 'B' : 'A') + keyString.slice(1);
+    assert.notEqual(keyString, flipped);
+    assert.notEqual(await generateKeyCheckTag(keyString), await generateKeyCheckTag(flipped));
+  });
+
+  it('node:crypto の SHA-256 による独立実装と一致する（ドメイン分離文字列 "cipherdrop-key-check-v1:" + 鍵、先頭 32bit・16進小文字）', async () => {
+    const { keyString } = await encryptData('独立検証用のメッセージ');
+    const expected = createHash('sha256').update(`cipherdrop-key-check-v1:${keyString}`, 'utf8').digest('hex').slice(0, 8);
+    assert.equal(await generateKeyCheckTag(keyString), expected);
+  });
+
+  it('ドメイン分離: 接頭辞の無い単純な SHA-256 とは一致しない（他の用途のハッシュと混同されない）', async () => {
+    const { keyString } = await encryptData('x');
+    const withoutDomainSeparation = createHash('sha256').update(keyString, 'utf8').digest('hex').slice(0, 8);
+    assert.notEqual(await generateKeyCheckTag(keyString), withoutDomainSeparation);
+  });
+
+  it('鍵の形式でない任意の文字列からも計算できる（空文字列を含め、例外にならない）', async () => {
+    for (const input of ['', 'not-a-real-key', 'a'.repeat(1000), 'こんにちは']) {
+      assert.match(await generateKeyCheckTag(input), /^[0-9a-f]{8}$/, JSON.stringify(input.slice(0, 20)));
+    }
   });
 });
 

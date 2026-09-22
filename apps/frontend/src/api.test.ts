@@ -176,3 +176,37 @@ describe('createApiClient: サーバーの応答は信頼せず検証する', ()
     }
   });
 });
+
+describe('createApiClient: 鍵確認値（keyCheck、任意）', () => {
+  it('createPayload: keyCheck を渡すと X-CipherDrop-Key-Check ヘッダーで送る。渡さなければヘッダー自体を付けない', async () => {
+    const { client, requests } = fakeFetch(() => json({ id: ID, expiresAt: '2026-09-23T00:00:00.000Z' }, 201));
+    const encryptedData = new ArrayBuffer(4);
+
+    await client.createPayload({ encryptedData, iv: IV, type: 'text', ttlSeconds: 3600, keyCheck: 'deadbeef' });
+    assert.deepEqual(requests[0]?.init.headers, {
+      'Content-Type': 'application/octet-stream',
+      'X-CipherDrop-IV': base64UrlEncode(IV),
+      'X-CipherDrop-Type': 'text',
+      'X-CipherDrop-TTL': '3600',
+      'X-CipherDrop-Key-Check': 'deadbeef',
+    });
+
+    await client.createPayload({ encryptedData, iv: IV, type: 'text', ttlSeconds: 3600 });
+    assert.equal('X-CipherDrop-Key-Check' in (requests[1]?.init.headers as Record<string, string>), false, 'keyCheck を渡さなければヘッダー自体が無い');
+  });
+
+  it('getMeta: レスポンスに keyCheck があれば結果に含める。無ければ結果にキー自体を含めない', async () => {
+    const { client } = fakeFetch(() => json({ type: 'text', size: 1, expiresAt: '2026-09-23T00:00:00.000Z', keyCheck: 'deadbeef' }));
+    assert.deepEqual(await client.getMeta(ID), { type: 'text', size: 1, expiresAt: new Date('2026-09-23T00:00:00.000Z'), keyCheck: 'deadbeef' });
+
+    const { client: withoutKeyCheck } = fakeFetch(() => json({ type: 'text', size: 1, expiresAt: '2026-09-23T00:00:00.000Z' }));
+    assert.deepEqual(await withoutKeyCheck.getMeta(ID), { type: 'text', size: 1, expiresAt: new Date('2026-09-23T00:00:00.000Z') });
+  });
+
+  it('getMeta: keyCheck の形式が不正（大文字・非16進・長さ違い・非文字列）なら invalid_response', async () => {
+    for (const bad of ['DEADBEEF', 'nothexch', 'short', 'deadbeefff', 123, null, '']) {
+      const { client } = fakeFetch(() => json({ type: 'text', size: 1, expiresAt: '2026-09-23T00:00:00.000Z', keyCheck: bad }));
+      assert.equal((await errorOf(client.getMeta(ID))).code, 'invalid_response', JSON.stringify(bad));
+    }
+  });
+});

@@ -18,7 +18,7 @@ import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { InMemoryPayloadStore, StoreFullError } from './store.ts';
-import type { PayloadStore, PayloadType } from './store.ts';
+import type { PayloadStore, PayloadType, StoredPayload } from './store.ts';
 
 // ---------------------------------------------------------------------------
 // API 仕様
@@ -33,11 +33,18 @@ export const HEADER_TTL = 'x-cipherdrop-ttl';
  * （「テキストを受信」「ファイルを受信」）にだけ使う。信頼できる種別は復号後のエンベロープが持つ。
  */
 export const HEADER_TYPE = 'x-cipherdrop-type';
+/**
+ * 鍵確認値（16進小文字 8 桁）。POST 任意。クライアントが鍵から一方向に導出した値で、コピペミス・
+ * 途中欠損の検出にだけ使う（フロントエンドの crypto.ts の generateKeyCheckTag を参照）。
+ * このサーバーは値の意味を解釈せず、そのまま保存して meta 応答で返すだけ。
+ */
+export const HEADER_KEY_CHECK = 'x-cipherdrop-key-check';
 
 const CREATE_PATH = '/api/payload';
 const ITEM_PATH = /^\/api\/payload\/([A-Za-z0-9_-]{22})\/(meta|consume)$/; // ID は 128bit = base64url 22 文字
 const ID_BYTES = 16;
 const IV_HEADER_PATTERN = /^[A-Za-z0-9_-]{16}$/; // 12 バイト = base64url 16 文字
+const KEY_CHECK_HEADER_PATTERN = /^[0-9a-f]{8}$/; // SHA-256 の先頭 32bit（16進小文字）
 const MIN_CIPHERTEXT_BYTES = 16; // AES-GCM の認証タグ長。これ未満は暗号文として成立しない
 const MIN_TTL_SECONDS = 60;
 
@@ -227,13 +234,18 @@ async function createPayload(req: IncomingMessage, res: ServerResponse, context:
   const ttlSeconds = parseTtl(req.headers[HEADER_TTL], context);
   if (ttlSeconds === null) return sendError(res, 400, 'invalid_ttl');
 
+  // 任意・ヒントのみ: 形式が不正でもリクエスト自体は失敗させず、無いものとして扱う（下の parseKeyCheck）。
+  const keyCheck = parseKeyCheck(req.headers[HEADER_KEY_CHECK]);
+
   const ciphertext = await readBody(req, context.maxPayloadBytes);
   if (ciphertext === null) return sendError(res, 413, 'payload_too_large', { Connection: 'close' });
   if (ciphertext.byteLength < MIN_CIPHERTEXT_BYTES) return sendError(res, 400, 'invalid_ciphertext');
 
   const id = randomBytes(ID_BYTES).toString('base64url');
+  // keyCheck が無ければキー自体を持たせない（保存するのは暗号文・IV・種別ヒント・鍵確認値（あれば）だけ）。
+  const stored: StoredPayload = keyCheck === undefined ? { ciphertext, iv, type } : { ciphertext, iv, type, keyCheck };
   try {
-    const { expiresAt } = await context.store.put(id, { ciphertext, iv, type }, ttlSeconds);
+    const { expiresAt } = await context.store.put(id, stored, ttlSeconds);
     sendJson(res, 201, { id, expiresAt: new Date(expiresAt).toISOString() });
   } catch (error) {
     if (error instanceof StoreFullError) return sendError(res, 503, 'storage_full', { 'Retry-After': '60' });
@@ -252,6 +264,14 @@ function parseIv(header: string | string[] | undefined): Buffer | null {
 
 function parseType(header: string | string[] | undefined): PayloadType | null {
   return header === 'text' || header === 'file' ? header : null;
+}
+
+/**
+ * 任意ヘッダーなので null（不正）ではなく undefined（無いものとして扱う）を返す。形式が不正でも
+ * リクエスト全体は失敗させない（あくまでコピペミス検出用のヒントで、無くても通常どおり動作する）。
+ */
+function parseKeyCheck(header: string | string[] | undefined): string | undefined {
+  return typeof header === 'string' && KEY_CHECK_HEADER_PATTERN.test(header) ? header : undefined;
 }
 
 function parseTtl(header: string | string[] | undefined, context: Context): number | null {
@@ -286,7 +306,8 @@ async function readMeta(res: ServerResponse, id: string, context: Context): Prom
   const meta = await context.store.stat(id);
   if (meta === null) return sendError(res, 404, 'not_found'); // 未発行・取得済み・期限切れを区別しない
 
-  sendJson(res, 200, { type: meta.type, size: meta.size, expiresAt: new Date(meta.expiresAt).toISOString() });
+  // meta.keyCheck が undefined なら、JSON.stringify がキー自体を落とす（後方互換: 旧データは "keyCheck" を持たない）。
+  sendJson(res, 200, { type: meta.type, size: meta.size, expiresAt: new Date(meta.expiresAt).toISOString(), keyCheck: meta.keyCheck });
 }
 
 // ---------------------------------------------------------------------------

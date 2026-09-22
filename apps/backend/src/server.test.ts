@@ -4,7 +4,7 @@ import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { describe, it } from 'node:test';
 import type { TestContext } from 'node:test';
-import { createServer, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_TTL, HEADER_TYPE } from './server.ts';
+import { createServer, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_KEY_CHECK, HEADER_TTL, HEADER_TYPE } from './server.ts';
 import type { LogEvent, ServerOptions } from './server.ts';
 import { InMemoryPayloadStore } from './store.ts';
 import type { InMemoryStoreOptions, PayloadMeta, StoredPayload } from './store.ts';
@@ -385,6 +385,36 @@ describe('POST /api/payload', () => {
       assert.equal(JSON.stringify(h.logs).includes('SECRET-INTERNAL-DETAIL'), false);
     });
   });
+});
+
+describe('POST /api/payload: 鍵確認値（X-CipherDrop-Key-Check、任意）', () => {
+  it('付けて作成すると、そのまま保存され、meta のレスポンスにも現れる', async (t) => {
+    const h = await startHarness(t);
+    const secret = await createSecret(h, { [HEADER_KEY_CHECK]: 'deadbeef' });
+
+    assert.equal(h.store.puts[0]?.payload.keyCheck, 'deadbeef');
+    const body = (await (await getMeta(h, secret.id)).json()) as { keyCheck?: string };
+    assert.equal(body.keyCheck, 'deadbeef');
+  });
+
+  it('付けずに作成すると、meta のレスポンス JSON に "keyCheck" キー自体が現れない（後方互換）', async (t) => {
+    const h = await startHarness(t);
+    const secret = await createSecret(h);
+
+    assert.equal(h.store.puts[0]?.payload.keyCheck, undefined);
+    const text = await (await getMeta(h, secret.id)).text();
+    assert.deepEqual(Object.keys(JSON.parse(text)).sort(), ['expiresAt', 'size', 'type']);
+  });
+
+  for (const bad of ['short', 'toolonghexvalue', 'DEADBEEF', 'not-hex!', '1234567', '123456789', '']) {
+    it(`形式が不正 (${JSON.stringify(bad)}) な値は無視される。作成自体は成功し、keyCheck は保存されない`, async (t) => {
+      const h = await startHarness(t);
+      const response = await postPayload(h, makeUpload(), { [HEADER_KEY_CHECK]: bad });
+
+      assert.equal(response.status, 201, '任意のヒントなので、不正でもリクエスト全体は失敗させない');
+      assert.equal(h.store.puts[0]?.payload.keyCheck, undefined);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

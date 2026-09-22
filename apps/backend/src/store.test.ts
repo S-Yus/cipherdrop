@@ -207,3 +207,22 @@ describe('InMemoryPayloadStore.stat（確認用: 何も消費しない）', () =
     assert.equal(store.size, 0);
   });
 });
+
+describe('InMemoryPayloadStore: 鍵確認値（keyCheck、任意）', () => {
+  it('put に含めれば、stat・take のどちらの戻り値にも、そのまま現れる', async () => {
+    const store = new InMemoryPayloadStore({ sweepIntervalMs: 0 });
+    await store.put('id', { ...payload(), keyCheck: 'deadbeef' }, 3600);
+
+    assert.equal((await store.stat('id'))?.keyCheck, 'deadbeef');
+    assert.equal((await store.take('id'))?.keyCheck, 'deadbeef');
+  });
+
+  it('含めなければ、stat の戻り値に "keyCheck" キー自体が現れない（type/size/expiresAt の 3 つだけ）', async () => {
+    const store = new InMemoryPayloadStore({ sweepIntervalMs: 0 });
+    await store.put('id', payload(), 3600);
+
+    const meta = await store.stat('id');
+    assert.deepEqual(Object.keys(meta ?? {}).sort(), ['expiresAt', 'size', 'type']);
+    assert.equal(meta?.keyCheck, undefined);
+  });
+});

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ApiError } from '../api.ts';
 import { mountApp } from '../app.ts';
-import { decryptPayload } from '../crypto.ts';
+import { decryptPayload, generateKeyCheckTag } from '../crypto.ts';
 import { MAX_UPLOAD_BYTES } from '../limits.ts';
 import { NOW, SAMPLE_ID, click, createTestEnv, dropFiles, has, makeFile, press, query, typeInto, waitFor } from '../testing/env.ts';
 import type { TestEnvOptions } from '../testing/env.ts';
@@ -133,7 +133,7 @@ describe('送信画面: バイト数の表示（等幅）', () => {
 });
 
 describe('送信画面: テキストの送信', () => {
-  it('暗号化して送信し、リンクを表示する。API に渡るのは暗号文・IV・種別・TTL だけで、鍵はどこにも現れない', async () => {
+  it('暗号化して送信し、リンクを表示する。API に渡るのは暗号文・IV・種別・TTL・鍵確認値だけで、鍵はどこにも現れない', async () => {
     const t = open();
     const secret = 'パスワードは Tr0ub4dor&3 です';
     typeInto(query<HTMLTextAreaElement>(t.main, '#message'), secret);
@@ -146,13 +146,15 @@ describe('送信画面: テキストの送信', () => {
     const call = t.calls[0];
     assert.ok(call?.method === 'createPayload');
     const input = call.args[0];
-    assert.deepEqual(Object.keys(input).sort(), ['encryptedData', 'iv', 'ttlSeconds', 'type'], 'API に渡す項目はこれだけ');
+    assert.deepEqual(Object.keys(input).sort(), ['encryptedData', 'iv', 'keyCheck', 'ttlSeconds', 'type'], 'API に渡す項目はこれだけ');
     assert.equal(input.type, 'text');
     assert.equal(input.ttlSeconds, 86_400);
     assert.equal(input.iv.byteLength, 12);
+    // 鍵確認値は、鍵から一方向に導出した値と一致する（サーバーへは鍵ではなくこれだけが渡る）
+    assert.equal(input.keyCheck, await generateKeyCheckTag(keyString));
 
-    // 鍵は、API に渡ったデータのどの表現にも現れない
-    const sent = Buffer.concat([Buffer.from(input.encryptedData), Buffer.from(input.iv)]);
+    // 鍵は、API に渡ったデータのどの表現にも現れない（鍵確認値も含めて調べる）
+    const sent = Buffer.concat([Buffer.from(input.encryptedData), Buffer.from(input.iv), Buffer.from(input.keyCheck ?? '', 'utf8')]);
     const rawKey = Buffer.from(keyString, 'base64url');
     for (const needle of [keyString, rawKey, rawKey.toString('hex'), rawKey.toString('base64'), secret]) {
       assert.equal(sent.includes(needle), false, '鍵・平文が API 引数に含まれている');

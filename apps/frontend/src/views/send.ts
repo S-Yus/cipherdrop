@@ -1,12 +1,13 @@
 /**
  * 送信画面（/）。
  *
- * 入力（テキスト or ファイル）をブラウザ内で暗号化し、暗号文と IV だけをサーバーへ送る。
+ * 入力（テキスト or ファイル）をブラウザ内で暗号化し、暗号文・IV・鍵確認値（任意）だけをサーバーへ送る。
  * 復号鍵は共有リンクの `#` 以降にだけ載せ、サーバーには送らない（api.ts の関数は鍵を受け取れない）。
+ * 鍵確認値は鍵から一方向に導出した短いタグで、鍵そのものではない（crypto.ts の generateKeyCheckTag）。
  */
 import { ApiError } from '../api.ts';
 import type { PayloadType } from '../api.ts';
-import { CipherDropCryptoError, encryptData, encryptFile } from '../crypto.ts';
+import { CipherDropCryptoError, encryptData, encryptFile, generateKeyCheckTag } from '../crypto.ts';
 import { createDom, cx } from '../dom.ts';
 import type { AppEnv, ViewHandle } from '../env.ts';
 import { formatBytes, formatDateTime, formatRemaining } from '../format.ts';
@@ -415,11 +416,16 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
         type = 'file';
       }
 
+      // 鍵確認値: 鍵から一方向に導出した短いタグ（鍵そのものではない）。受取画面が、コピペミス・
+      // 途中欠損で違う内容になった鍵を、消費する前に検出するために使う。
+      const keyCheck = await generateKeyCheckTag(encrypted.keyString);
+
       const { id, expiresAt } = await env.api.createPayload({
         encryptedData: encrypted.encryptedData,
         iv: encrypted.iv,
         type,
         ttlSeconds,
+        keyCheck,
       });
       if (destroyed) return;
 

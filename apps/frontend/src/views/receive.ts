@@ -6,10 +6,15 @@
  *
  * これにより、リンクプレビュー・クローラー・セキュリティスキャナがこのページを開いても、データは消えない。
  * 復号後のテキストは renderTextSafely（テキストノード）でだけ描画し、HTML としては一切解釈しない。
+ *
+ * Stage 1 では、URL の鍵の形式検証（isValidKeyString）に加えて、meta.keyCheck があればローカルで
+ * 計算した確認値と照合する（keyCheckMismatch）。不一致なら「開く」ボタン自体を描画せず、POST consume を
+ * 発行する手段を作らない。コピペミス・途中欠損で「形式は正しいが内容が違う」鍵によって、消費（＝サーバー
+ * 側の物理削除）だけが先に起きてデータが失われる事故を防ぐ。
  */
 import { ApiError } from '../api.ts';
 import type { PayloadMeta } from '../api.ts';
-import { decryptPayload, isValidKeyString, renderTextSafely } from '../crypto.ts';
+import { decryptPayload, generateKeyCheckTag, isValidKeyString, renderTextSafely } from '../crypto.ts';
 import type { DecryptedPayload } from '../crypto.ts';
 import { createDom, cx } from '../dom.ts';
 import type { Children } from '../dom.ts';
@@ -23,6 +28,7 @@ type Phase =
   | { name: 'invalid-link' }
   | { name: 'unavailable' }
   | { name: 'load-error' }
+  | { name: 'key-mismatch' }
   | { name: 'confirm'; meta: PayloadMeta }
   | { name: 'opening'; meta: PayloadMeta }
   | { name: 'open-error'; meta: PayloadMeta }
@@ -79,6 +85,12 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
           action: 'retry',
           onClick: () => void load(),
         });
+      case 'key-mismatch':
+        // 「開く」ボタンを含む confirmCard は描画しない（消費リクエストを発行する手段を、そもそも作らない）。
+        return messageCard('danger', '鍵が一致しません', [
+          '共有リンクの復号鍵が正しくないか、途中で切れています。データの消滅を防ぐため、開く処理を停止しました。',
+          '正しい URL を確認してください。',
+        ]);
       case 'open-error': {
         const { meta } = phase;
         return messageCard('danger', '取得に失敗しました', ['通信の途中で切断された場合、データは既に削除されている可能性があります。'], {
@@ -228,13 +240,30 @@ export function mountReceiveView(env: AppEnv, container: HTMLElement, route: { i
     try {
       const meta = await env.api.getMeta(id);
       if (destroyed) return;
-      phase = { name: 'confirm', meta };
+      phase = (await keyCheckMismatch(meta)) ? { name: 'key-mismatch' } : { name: 'confirm', meta };
     } catch (error) {
       if (destroyed) return;
       phase = error instanceof ApiError && error.code === 'not_found' ? { name: 'unavailable' } : { name: 'load-error' };
     }
     pendingFocus = '[data-autofocus]';
     render();
+  }
+
+  /**
+   * meta.keyCheck と、URL の鍵からローカルで計算した確認値を照合する。「確実に違うと分かる」ときだけ true。
+   *   - meta.keyCheck が無い（旧データ・未対応の送信側）→ 判定できないので false（＝通常どおり続行）
+   *   - ローカルでの計算自体が失敗した（WebCrypto 不使用環境など）→ 同様に false
+   *   - 両方そろっていて、値が一致しない → true（＝鍵が壊れている。消費させない）
+   * 「判定できない」場合を false 側に倒すのは、誤検出でデータへの到達自体を妨げないための安全側の既定値。
+   * その場合も、消費（POST consume）自体は AES-GCM の認証タグが最終的な防御として機能する。
+   */
+  async function keyCheckMismatch(meta: PayloadMeta): Promise<boolean> {
+    if (meta.keyCheck === undefined) return false;
+    try {
+      return (await generateKeyCheckTag(keyString)) !== meta.keyCheck;
+    } catch {
+      return false;
+    }
   }
 
   /** Stage 2: 受信者が明示的にボタンを押したときだけ呼ばれる。取得（＝サーバー側で削除）して復号する。 */
