@@ -1,0 +1,13 @@
+{
+  "name": "@cipherdrop/tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CipherDrop cross-app tests: E2E, security policy, design rules, source hygiene. Not shipped.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test \"**/*.test.ts\"",
+    "check": "npm run typecheck && npm test",
+    "build": "npm run typecheck"
+  }
+}

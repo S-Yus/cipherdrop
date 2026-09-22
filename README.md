@@ -63,7 +63,7 @@ cipherdrop/
 │       └── src/
 │           ├── server.ts            #   POST /api/payload, GET …/:id/meta, POST …/:id/consume
 │           └── store.ts             #   暗号文ストア（stat = 副作用なし / take = 取得と削除が不可分）
-├── tests/                           # アプリ横断のテスト
+├── tests/                           # アプリ横断のテスト（それ自体も 1 つの npm workspace）
 │   ├── zero-knowledge.e2e.test.ts   #   API 層の E2E（生 TCP を記録して鍵・平文の不在を証明）
 │   ├── ui-flow.e2e.test.ts          #   UI 経由の E2E（実サーバー + 画面コード + 暗号）
 │   ├── build-output.test.ts         #   `vite build` の配布物を検査（CSP・インライン・外部通信・CSS のデザイン規則）
@@ -71,7 +71,7 @@ cipherdrop/
 │   ├── source-hygiene.test.ts       #   生の制御文字・双方向制御文字（Trojan Source）の混入を禁止
 │   └── security-policy.test.ts      #   絶対遵守ルールをコードレベル（AST）で強制
 ├── tsconfig.base.json
-└── package.json                     # npm workspaces
+└── package.json                     # npm workspaces（apps/* と tests）
 ```
 
 ## 始め方
@@ -80,10 +80,18 @@ Node.js **24.2 以上**が必要（`.ts` をそのまま実行する Node のネ
 
 ```bash
 npm ci               # 依存は完全固定（.npmrc の save-exact / package-lock.json）
-npm run check        # 型チェック + 全テスト
+npm run check        # 型チェック + 全テスト（backend / frontend / tests の各ワークスペースを横断）
 ```
 
-開発（ターミナルを 2 つ）:
+開発:
+
+```bash
+npm run dev   # backend（:8787）と frontend（:5173）を 1 コマンドで並列起動する
+```
+
+`dev` はシェルのジョブ制御（`&` / `wait`）で 2 つの `npm run dev --workspace ...` を同じプロセスグループで動かしている
+（npm の `run-script` 自体には複数ワークスペースを並列実行する機能が無いため）。Ctrl+C は両方に届き、一緒に終了する。
+ログを分けて見たい・個別に再起動したい場合は、従来どおり 2 つのターミナルで個別に起動できる:
 
 ```bash
 npm run dev:backend    # API: http://127.0.0.1:8787（PORT / HOST で変更）
@@ -124,6 +132,8 @@ curl -s -X POST http://127.0.0.1:8787/api/payload \
 **受取・復号 (`/v/:id#key`)**
 1. **Stage 1（確認）**: 読み込み時に `GET …/meta` だけを呼ぶ。種類・サイズ・有効期限・暗号方式を等幅で示し、amber の静かな通知（`border-amber-500/20 bg-amber-500/5`）で
    「**このデータは一度開くとサーバーから永久削除されます**」と事実だけを伝える。**ここでは何も消費しない。**
+   `meta.keyCheck` があり、URL の鍵から計算した値と一致しなければ、「開く」ボタン自体を出さず `POST …/consume` を発行しない
+   （「鍵が一致しません」。詳細は「鍵確認値」の節）。
 2. **Stage 2（消費・復号）**: 「データを復号して表示」（ファイルは「データを復号してダウンロード」）を押したときだけ `POST …/consume`。
    テキストは `renderTextSafely`（テキストノード）で等幅のコードブロックに表示し、**「コピー」「破棄」**をワンクリックで実行できる。
    「破棄」は表示中のデータ（テキスト・ファイルのバイト列）への参照を手放して画面から消去する（サーバー上のデータは取得時に削除済みなので、再表示はできない）。
@@ -150,8 +160,8 @@ curl -s -X POST http://127.0.0.1:8787/api/payload \
 
 | | |
 | --- | --- |
-| `POST /api/payload` | 本文: 暗号文（`application/octet-stream`）。ヘッダー: `X-CipherDrop-IV`（必須・base64url の 12 バイト）、`X-CipherDrop-Type`（必須・`text` \| `file`）、`X-CipherDrop-TTL`（任意・秒。既定 86400、範囲 60〜604800）。→ `201 {"id","expiresAt"}` |
-| `GET /api/payload/:id/meta` | → `200 {"type","size","expiresAt"}`（`size` は暗号文のバイト数）。**何も消費・変更しない**。存在しない・消費済み・期限切れは `404`。 |
+| `POST /api/payload` | 本文: 暗号文（`application/octet-stream`）。ヘッダー: `X-CipherDrop-IV`（必須・base64url の 12 バイト）、`X-CipherDrop-Type`（必須・`text` \| `file`）、`X-CipherDrop-TTL`（任意・秒。既定 86400、範囲 60〜604800）、`X-CipherDrop-Key-Check`（任意・16進小文字 8 桁。形式が不正なら黙って無視する）。→ `201 {"id","expiresAt"}` |
+| `GET /api/payload/:id/meta` | → `200 {"type","size","expiresAt","keyCheck"?}`（`size` は暗号文のバイト数。`keyCheck` は送信時に付いていた場合だけ現れる）。**何も消費・変更しない**。存在しない・消費済み・期限切れは `404`。 |
 | `POST /api/payload/:id/consume` | → `200` 暗号文 + `X-CipherDrop-IV`。**返す前にストアから完全に削除する**（アトミック）。存在しない・消費済み・期限切れは `404`。 |
 
 | ステータス | `error` | 条件 |
@@ -182,6 +192,20 @@ ID は 128bit の乱数（base64url 22 文字）。全レスポンスに `Cache-
 - 受信したファイル名は送信者が決めた信頼できない値。`sanitizeFileName` でパス区切り・制御文字・**双方向制御文字**・
   Windows 予約名・長大な名前を無害化してから表示・保存する。保存は常に `application/octet-stream`（送信者の MIME 型は使わない）。
 
+### 鍵確認値（Key Check Tag）
+
+共有リンクのコピペミス・途中欠損（形式は正しいが内容が違う鍵）を、**消費する前に**検出するための仕組み。
+
+- `generateKeyCheckTag(keyStr)` = `SHA-256("cipherdrop-key-check-v1:" + keyStr)` の先頭 32bit（16進小文字 8 桁）。
+- 送信画面は生成時にこれを計算し、`X-CipherDrop-Key-Check` としてサーバーへ送る（任意項目・後方互換）。
+- 受取画面は Stage 1（`GET …/meta`）の直後、URL の鍵からローカルで同じ値を計算して照合する。**不一致が確実な場合だけ**
+  「開く」ボタン自体を出さず、`POST …/consume` を発行する手段を作らない（誤検出の余地があるとき＝ meta に
+  `keyCheck` が無い・計算自体が失敗した、は安全側に倒して通常どおり続行する）。
+- **既知のトレードオフ**: これは絶対遵守ルール「復号鍵はサーバーに送らない」の例外ではないが、鍵の一方向関数の出力の
+  一部（32bit）は新たにサーバーへ渡ることになる。256bit の鍵を 32bit 絞り込んでも残り 224bit の全数探索は非現実的
+  なので、これが鍵の総当たりを実用的に助けることはない。ただし「サーバーは鍵について一切の情報を持たない」という
+  意味の完全なゼロ知識ではなくなる。詳細な設計意図は `crypto.ts` の `generateKeyCheckTag` のコメントを参照。
+
 ```ts
 import { decryptPayload, encryptData, encryptFile, renderTextSafely } from './crypto.ts';
 
@@ -199,7 +223,7 @@ if (payload.type === 'text') renderTextSafely(document.getElementById('out')!, p
 
 | ルール | 実装 | 検証 |
 | --- | --- | --- |
-| 鍵は `#` にだけ置き、サーバーに送らない | `encryptData` は鍵を返すだけ。`api.ts` は鍵を受け取れず、ID も形式検証する。サーバーはクエリを拒否 | **E2E（API 層・UI 層）**: サーバーが受信した生 TCP バイトを全記録し、鍵・平文・ファイル名が生／hex／base64／部分列のどれでも現れないこと、受信リクエストが想定の本数だけでフラグメント・クエリ・Cookie が無いこと |
+| 鍵は `#` にだけ置き、サーバーに送らない | `encryptData` は鍵を返すだけ。`api.ts` は鍵を受け取れず、ID も形式検証する。サーバーはクエリを拒否 | **E2E（API 層・UI 層）**: サーバーが受信した生 TCP バイトを全記録し、鍵・平文・ファイル名が生／hex／base64／部分列のどれでも現れないこと、受信リクエストが想定の本数だけでフラグメント・クエリ・Cookie が無いこと（鍵確認値ヘッダーを含めて検査する。鍵そのものではなく、鍵の一方向関数の出力の一部だけを送る設計上のトレードオフは「鍵確認値」の節を参照） |
 | Web Crypto の AES-GCM 256、IV は毎回生成 | `crypto.ts` | OpenSSL（`node:crypto`）との相互運用、200 回で鍵・IV・暗号文がすべて異なること、外部 import が無いこと |
 | 1 回読んだら即・物理削除（かつ、開く前には消えない） | `store.take()`（取得と削除が不可分）。`stat()` は副作用なし・戻り値の型に暗号文を含まない。`consume` は POST のみ | 削除が応答より先、50 並行 consume で成功 1 回、**GET / HEAD / OPTIONS / 旧 URL を浴びせても消えない**。読み込み時の処理が `consume` を呼ばないこと（実行時 + AST） |
 | XSS・ログ漏洩 | `renderTextSafely`（テキストノード）／DOM ビルダー（HTML 挿入なし・属性は許可リスト）／ログは固定スキーマ型のみ／厳格な CSP | XSS 文字列が要素にならないこと（jsdom・実ブラウザ）。`innerHTML` 等・`eval`・`console.*` を **AST で検査**。`setAttribute` は `dom.ts` だけ。**配布物にも** HTML 挿入 API・インライン・外部 URL が無いこと |
@@ -233,8 +257,11 @@ if (payload.type === 'text') renderTextSafely(document.getElementById('out')!, p
    ただし、**ページの JS を実行したうえでボタンまで自動でクリックする**種類のスキャナは消費し得る。
    取得直後に通信が切れても暗号文は復元しない（安全側）。POST の再送で 2 回目が 404 になり得るため、プロキシの再試行は無効にすること。
 3. **鍵が誤っていると、データだけが失われ得る。** 欠け・余分な文字・形式不正は、消費する前に検出して止める。
-   一方、形式は正しいが 1 文字違うような鍵は、消費後の復号失敗で初めて分かる（鍵確認値の導入は今後の検討）。
-4. **メタデータは見える。** 暗号文のサイズ、種別ヒント（text / file）、作成・期限・取得の時刻。パディングは未実装。
+   形式は正しいが内容が違う（コピペミス・途中欠損）鍵も、**鍵確認値**（送信時に任意で付ける、鍵から一方向に導出した
+   32bit のタグ）があれば消費する前に検出して止める。ただし鍵確認値は送信側が省略でき、旧データにも存在しないので、
+   その場合は従来どおり消費後の復号失敗で初めて分かる（安全側の既定動作。詳細は「鍵確認値」の節）。
+4. **メタデータは見える。** 暗号文のサイズ、種別ヒント（text / file）、作成・期限・取得の時刻、鍵確認値（あれば・鍵の
+   一方向関数の出力の 32bit）。パディングは未実装。
 5. **削除の意味。** ストアから削除してから応答する。メモリ／ディスクのゼロ埋めは保証しない（保持しているのは暗号文のみで、鍵は無い）。
 6. **インメモリ保存（MVP）。** 再起動すると未読の暗号文は消える。件数ではなく合計バイト数で上限を持つ。
 7. **認証・レート制限は未実装。** ID を知っていれば誰でも「消費」できる（DoS）。ID は推測不能だが、公開前にレート制限を入れること。
@@ -251,8 +278,15 @@ if (payload.type === 'text') renderTextSafely(document.getElementById('out')!, p
   ブラウザでは `main.ts` が実物を、テストでは jsdom と偽物を渡すので、同じコードが両方で動く（`src/testing/`）。
 - 画面は `dom.ts` のビルダーで組み立てる。文字列は常にテキストノードになり、`on*`・`style`・`srcdoc`・任意 URL の属性は設定できない。
 - 色は Tailwind の標準パレット（zinc / emerald / amber / red）を class で直接指定する（独自の色トークンは持たない）。追加・変更は `ui.ts` に集約する。
+- `tests/` も `apps/*` と同じく npm workspace（`@cipherdrop/tests`）。ルートの `dev` / `build` / `check` は
+  `npm run <script> --workspaces` を使うので、追加するワークスペースには同名のスクリプトが必要
+  （無いと `npm run build` のようにワークスペースを跨ぐコマンドがそこで失敗する）。
+- ルートの `npm run dev` は `npm run <script> --workspaces` を使っていない。npm の `run-script` に複数ワークスペースを
+  並列実行する機能が無い（`--parallel` のような公式フラグは存在しない）ため、シェルのジョブ制御
+  （`cmd1 & cmd2 & wait`）で 2 つの `npm run dev --workspace ...` を同じプロセスグループで動かしている。
+  Ctrl+C は両方に届く。
 
 ## 今後
 
-レート制限／パスワード保護／パディング／鍵確認値／ファイルシステムまたは Redis（`GETDEL`）ストア／SRI とソース公開／
+レート制限／パスワード保護／パディング／ファイルシステムまたは Redis（`GETDEL`）ストア／SRI とソース公開／
 複数ファイル（zip）／受信者向けの「人間確認」（自動クリックするスキャナ対策）。
