@@ -61,15 +61,24 @@ cipherdrop/
 │   │       └── app.ts / main.ts     #   ヘッダーと画面の振り分け / ブラウザのエントリー
 │   └── backend/                     # API サーバー（ランタイム依存 0）
 │       └── src/
-│           ├── server.ts            #   POST /api/payload, GET …/:id/meta, POST …/:id/consume
+│           ├── server.ts            #   POST /api/payload, GET …/:id/meta, POST …/:id/consume, GET …/ping
 │           └── store.ts             #   暗号文ストア（stat = 副作用なし / take = 取得と削除が不可分）
+├── deploy/                          # コンテナ内の配信設定（Dockerfile から COPY される）
+│   ├── nginx.conf                   #   静的配信（8080）+ /api リバースプロキシ。非 root 前提
+│   ├── security-headers.conf        #   HSTS・CSP 等。/api/ には付けない（バックエンド自身が付ける）
+│   └── entrypoint.sh                #   nginx -t → nginx（背景）→ exec node（PID 1 の子として）
 ├── tests/                           # アプリ横断のテスト（それ自体も 1 つの npm workspace）
 │   ├── zero-knowledge.e2e.test.ts   #   API 層の E2E（生 TCP を記録して鍵・平文の不在を証明）
 │   ├── ui-flow.e2e.test.ts          #   UI 経由の E2E（実サーバー + 画面コード + 暗号）
 │   ├── build-output.test.ts         #   `vite build` の配布物を検査（CSP・インライン・外部通信・CSS のデザイン規則）
 │   ├── design-rules.test.ts         #   デザイン規則を強制（色・グラデーション・影・コピー・構成）
 │   ├── source-hygiene.test.ts       #   生の制御文字・双方向制御文字（Trojan Source）の混入を禁止
+│   ├── infra.test.ts                #   Dockerfile・nginx・docker-compose を静的に検査（CSP・バージョン等の整合）
 │   └── security-policy.test.ts      #   絶対遵守ルールをコードレベル（AST）で強制
+├── Dockerfile                       # マルチステージ（builder → runner）。USER node・HEALTHCHECK 付き
+├── docker-compose.yml               # app（CipherDrop 本体）+ cloudflared（Cloudflare Tunnel）
+├── .dockerignore
+├── .env.example                     # docker-compose.yml が読む TUNNEL_TOKEN のひな形
 ├── tsconfig.base.json
 └── package.json                     # npm workspaces（apps/* と tests）
 ```
@@ -163,6 +172,7 @@ curl -s -X POST http://127.0.0.1:8787/api/payload \
 | `POST /api/payload` | 本文: 暗号文（`application/octet-stream`）。ヘッダー: `X-CipherDrop-IV`（必須・base64url の 12 バイト）、`X-CipherDrop-Type`（必須・`text` \| `file`）、`X-CipherDrop-TTL`（任意・秒。既定 86400、範囲 60〜604800）、`X-CipherDrop-Key-Check`（任意・16進小文字 8 桁。形式が不正なら黙って無視する）。→ `201 {"id","expiresAt"}` |
 | `GET /api/payload/:id/meta` | → `200 {"type","size","expiresAt","keyCheck"?}`（`size` は暗号文のバイト数。`keyCheck` は送信時に付いていた場合だけ現れる）。**何も消費・変更しない**。存在しない・消費済み・期限切れは `404`。 |
 | `POST /api/payload/:id/consume` | → `200` 暗号文 + `X-CipherDrop-IV`。**返す前にストアから完全に削除する**（アトミック）。存在しない・消費済み・期限切れは `404`。 |
+| `GET /api/payload/ping` | → `200 {"status":"ok"}`。ヘルスチェック専用。ストアには一切触れない。Docker の `HEALTHCHECK` が叩く。 |
 
 | ステータス | `error` | 条件 |
 | --- | --- | --- |
@@ -231,19 +241,62 @@ if (payload.type === 'text') renderTextSafely(document.getElementById('out')!, p
 実装を意図的に壊して（削除しない・GET でも消費・読み込み時に自動消費・`innerHTML` 化・鍵を API へ渡す・CSP を外す・外部フォントを読む …）
 テストが落ちることも確認済み。
 
-## 配信（デプロイ）の要件
+## 配信（デプロイ）
 
-フロントエンド（`apps/frontend/dist`）とバックエンドを、TLS 終端するリバースプロキシの背後に置く。
+以前は「配信側（リバースプロキシ）が満たすべき要件」を文章で列挙していただけだったが、いまはルートの
+`Dockerfile` / `docker-compose.yml` / `deploy/` 一式がそれをそのまま実装している。
 
-1. **HTTPS 必須**（HTTP では `crypto.subtle` が使えず、配信物の改ざんも防げない）。HSTS を付ける。
-2. **SPA フォールバック**: `/v/*` を含む、実在しないパスは `index.html` を返す。`index.html` は `Cache-Control: no-store`（または `no-cache`）、
-   `assets/*`（ハッシュ付き）は長期キャッシュでよい。
-3. **`/api/` をバックエンドへ中継**（既定 `127.0.0.1:8787`）。リクエストボディの上限は 10 MiB 以上。
-   **再試行は無効にする**（nginx: `proxy_next_upstream off`）。
-4. **レスポンスヘッダー**で `Content-Security-Policy: frame-ancestors 'none'`（または `X-Frame-Options: DENY`）を付ける。
-   ビルド済み HTML の CSP は `<meta>` で埋め込まれているが、`<meta>` では `frame-ancestors` が効かない。
-   `X-Content-Type-Options: nosniff` と `Referrer-Policy: no-referrer` も付ける（HTML 側にも `<meta name="referrer">` はある）。
-5. アクセスログにリクエストボディ・クエリを出さない。IP アドレスはプロキシのログに残り得るので、保持方針を決める。
+1. **HTTPS 必須**（HTTP では `crypto.subtle` が使えず、配信物の改ざんも防げない）。HSTS を付ける
+   → `deploy/security-headers.conf`（`max-age=31536000; includeSubDomains; preload`）。
+2. **SPA フォールバック**: `/v/*` を含む、実在しないパスも `index.html` を返す。`index.html` は `Cache-Control: no-store`、
+   `assets/*`（ハッシュ付き）は長期キャッシュ → `deploy/nginx.conf` の `location = /index.html` / `location /assets/`。
+3. **`/api/` をバックエンドへ中継**。リクエストボディの上限はバックエンドの上限（10 MiB）以上。
+   **再試行は無効にする** → `deploy/nginx.conf` の `location /api/`（`proxy_next_upstream off`）。
+4. **レスポンスヘッダー**で `Content-Security-Policy`（`frame-ancestors 'none'` を含む）・`X-Content-Type-Options: nosniff`・
+   `X-Frame-Options: DENY`・`Referrer-Policy: no-referrer` を付ける → `deploy/security-headers.conf`
+   （`apps/frontend/vite.config.ts` が `<meta>` に埋め込む CSP と同じ内容 + `frame-ancestors`。`<meta>` では効かないため、
+   ここが最終的な強制点になる）。バックエンド自身の応答（`/api/*`）にも同等のヘッダーを付けている
+   （`apps/backend/src/server.ts` の `BASE_HEADERS`）。
+5. アクセスログにリクエストボディ・クエリを出さない → `deploy/nginx.conf` はリクエスト行とステータスだけを
+   標準出力へ出す既定のログ形式のまま。バックエンドのログは固定スキーマ型のみ（`server.ts` の `LogEvent`）。
+
+両方が同じ CSP を主張し続けているかは、`tests/infra.test.ts` が機械的に突き合わせて検査する（食い違えばテストが落ちる）。
+
+### Docker でのデプロイ
+
+```bash
+cp .env.example .env    # TUNNEL_TOKEN を設定する（下記）
+docker compose up -d --build
+curl http://127.0.0.1:8080/api/payload/ping    # {"status":"ok"} が返ればローカルで疎通している
+```
+
+- **`Dockerfile`**（2 段階ビルド）: Stage 1 (`builder`) で `apps/backend` と `apps/frontend` をビルドし、
+  Stage 2 (`runner`) は最小限の `node:24-alpine` + `nginx`（静的配信 + `/api` リバースプロキシ）+ `tini`（PID 1）だけを積む。
+  `apps/backend` はランタイム依存パッケージが 0 なので、`node_modules` は最終イメージに一切コピーしていない
+  （実行時に存在する npm パッケージが 0 個）。`USER node`（非 root）で動かすため、nginx は 80 番ではなく 8080 番で
+  待ち受け、PID・一時ファイルはすべて書き込み可能な `/tmp` 配下に置いている
+  （[nginx 公式の非 root 用イメージ](https://github.com/nginx/docker-nginx-unprivileged) と同じ構成）。
+  `HEALTHCHECK` は `GET /api/payload/ping`（ストアに触れないヘルスチェック専用エンドポイント）を叩く。
+- **Node のバージョン**: `node:24-alpine` を使う（`node:22-alpine` は使っていない）。`import.meta.main` は
+  Node v24.2.0 で追加された API（v22.18.0 にバックポート）で、本プロジェクトの `engines.node`（`>=24.2.0`）はこれに
+  合わせて決めている。古い Node で動かすと、バックエンドのエントリポイント（`if (import.meta.main)`）が実行されず、
+  サーバーが起動しないまま「動いているように見える」不具合になり得るため、`tests/infra.test.ts` が Dockerfile の
+  イメージタグを `engines.node` と突き合わせて検査する。
+- **`docker-compose.yml`**: `app`（このイメージ。診断用に `127.0.0.1:8080` にだけ公開し、`0.0.0.0` へは出さない）と
+  `cloudflared`（Cloudflare Tunnel、バージョン固定）の 2 サービス。Cloudflare Tunnel はアウトバウンド接続だけで動くので、
+  自宅サーバー・NAT の背後でもポート開放が要らない。`cloudflared` は `app` が healthy になるまで起動を待つ
+  （`depends_on: condition: service_healthy`）。
+- **`.env`**（`.env.example` からコピー、コミットしない）: `TUNNEL_TOKEN` は Cloudflare Zero Trust ダッシュボード →
+  Networks → Tunnels → 接続方法「Docker」で発行されるトークン。トンネルの Public Hostname の送信先（Service）は
+  `http://app:8080` に向ける（`app` はこの compose 内のサービス名）。
+
+**検証の限界（正直に書いておく）**: このリポジトリを検証した環境には Docker デーモンが無く、`docker build` /
+`docker run` を実際には実行できていない。確認できたのはあくまで静的な検査（`tests/infra.test.ts`: マルチステージの
+段数・非 root 設定・ヘルスチェックの URL・CSP の一致・Node バージョンなどをファイルの中身から突き合わせる）と、
+`package-lock.json` に `linux-x64-musl` / `linux-arm64-musl`（Tailwind の `@tailwindcss/oxide`・`lightningcss`・
+`vite` の `@rolldown/binding`）の最適依存が含まれていること（= alpine=musl 環境でも `npm ci` が正しいネイティブ
+バイナリを選べるはず、という根拠）まで。**実際に `docker compose up -d --build` を実行し、`curl` でヘルスチェックと
+実際の送受信フローが動くことを確認してから本番投入すること。**
 
 ## 信頼モデルと既知の制約
 
