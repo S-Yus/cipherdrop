@@ -1,0 +1,60 @@
+/**
+ * 受信したファイル名の無害化。
+ *
+ * 送信者は受信者にとって信頼できない相手で、ファイル名は暗号文の内側で送信者が自由に決められる。
+ * そのまま表示・保存名に使うと、次のような問題がある。
+ *   - パス区切り・`..`・先頭のドットによる保存先の混乱（ディレクトリ・トラバーサル、隠しファイル化）
+ *   - 制御文字・ゼロ幅文字・**双方向制御文字**（U+202E で「invoice_fdp.exe」を「invoice_exe.pdf」に見せかける）
+ *   - Windows の予約名（CON, NUL, COM1 …）や、末尾のドット・空白
+ *   - 極端に長い名前
+ */
+
+export const FALLBACK_FILE_NAME = 'cipherdrop-file';
+const MAX_CODE_POINTS = 120;
+
+/** 制御文字（C0/C1）・ゼロ幅・双方向制御・BOM・Unicode 置換用の指示文字。 */
+const INVISIBLE_OR_CONTROL = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\uFFF9-\uFFFB]/gu;
+/** パス区切りと、Windows でファイル名に使えない文字。 */
+const FORBIDDEN_CHARACTERS = /[\\/:*?"<>|]/gu;
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/iu;
+
+export function sanitizeFileName(input: string): string {
+  let name = String(input).replace(INVISIBLE_OR_CONTROL, '').replace(FORBIDDEN_CHARACTERS, '_');
+
+  // 先頭のドット・空白（`..`、隠しファイル）と、末尾のドット・空白（Windows が黙って削る）を落とす。
+  name = name.replace(/^[\s.]+/u, '').replace(/[\s.]+$/u, '');
+  if (name === '') return FALLBACK_FILE_NAME;
+
+  if (WINDOWS_RESERVED.test(name)) name = `_${name}`;
+  return truncatePreservingExtension(name, MAX_CODE_POINTS);
+}
+
+/** 長すぎる名前を、拡張子を残したまま切り詰める（サロゲートペアを壊さないようコードポイント単位）。 */
+function truncatePreservingExtension(name: string, maxCodePoints: number): string {
+  const chars = Array.from(name);
+  if (chars.length <= maxCodePoints) return name;
+
+  const dot = name.lastIndexOf('.');
+  const extension = dot > 0 ? name.slice(dot + 1) : '';
+  const keepExtension = /^[A-Za-z0-9]{1,16}$/u.test(extension);
+
+  const suffix = keepExtension ? `.${extension}` : '';
+  const base = Array.from(keepExtension ? name.slice(0, dot) : name);
+  const truncated = base.slice(0, maxCodePoints - Array.from(suffix).length).join('').replace(/[\s.]+$/u, '');
+  return `${truncated === '' ? FALLBACK_FILE_NAME : truncated}${suffix}`;
+}
+
+/** 開くと危険になり得る拡張子（実行ファイル・スクリプト・ブラウザで開くと動くもの・マクロ付き Office など）。 */
+const RISKY_EXTENSIONS = new Set([
+  'exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'pif', 'lnk', 'hta', 'cpl', 'dll', 'reg',
+  'js', 'jse', 'vbs', 'vbe', 'wsf', 'wsh', 'ps1', 'psm1', 'sh', 'jar', 'apk', 'app', 'dmg', 'pkg', 'deb', 'rpm',
+  'html', 'htm', 'xhtml', 'svg', 'iso', 'img',
+  'docm', 'xlsm', 'pptm', 'dotm', 'xltm',
+]);
+
+/** 拡張子（最後のドットの後ろ）が、注意喚起すべきものか。受信画面で警告を出すために使う。 */
+export function hasRiskyExtension(fileName: string): boolean {
+  const dot = fileName.lastIndexOf('.');
+  if (dot < 0) return false;
+  return RISKY_EXTENSIONS.has(fileName.slice(dot + 1).trim().toLowerCase());
+}

@@ -1,23 +1,56 @@
 /**
  * 暗号文ストア。
  *
- * サーバーが保持してよいのは「暗号文・IV・有効期限」だけ。平文も鍵も、このプロセスには存在しない。
+ * サーバーが保持してよいのは「暗号文・IV・有効期限・表示用の種別ヒント・鍵確認値（任意）」だけ。
+ * 平文も鍵そのものも、このプロセスには存在しない
+ * （鍵確認値は鍵から一方向に導出した 32bit のヒントで、鍵は復元できない。crypto.ts 参照）。
  *
- * 読み出し口は take()（取得と削除が不可分）だけにしている。「削除せずに読む」get() を
- * 用意しないことで、1 回読み切り（Self-Destruct）を API の形そのもので保証する。
+ * 暗号文がストアの外へ出る経路は take()（取得と削除が不可分）だけにしている。
+ * 「削除せずに暗号文を読む」get() を用意しないことで、1 回読み切り（Self-Destruct）を
+ * API の形そのもので保証する。
+ *
+ * 受信者に事前確認（メタ情報の表示）をさせるための stat() は、状態を一切変えず、
+ * 戻り値の型にも暗号文・IV を含めない。リンクプレビューやクローラーが叩いても何も失われない。
+ *
  * 実装を差し替える場合も take() の原子性は必須:
- *   - Redis:      GETDEL（Redis >= 6.2）/ 書き込みは SET ... EX
+ *   - Redis:      GETDEL（Redis >= 6.2）/ 書き込みは SET ... EX / stat は STRLEN + TTL
  *   - ファイル:   rename() で専有してから読み、unlink() する
  */
+
+/** 表示用の種別。暗号化されないヒントで、信頼できる種別は暗号文の内部（認証済みタグ）にある。 */
+export type PayloadType = 'text' | 'file';
 
 export interface StoredPayload {
   ciphertext: Uint8Array;
   iv: Uint8Array;
+  type: PayloadType;
+  /**
+   * 鍵確認値（16進小文字 8 桁、任意）。共有リンクのコピペミス・途中欠損を受信側で検出するためのヒントで、
+   * 暗号強度には寄与しない（クライアントが鍵から一方向に導出した値。詳細は crypto.ts の generateKeyCheckTag）。
+   * 省略された場合（旧データ・未対応の送信側）は保存しない。
+   */
+  keyCheck?: string;
+}
+
+/** 暗号文の中身に触れずに公開してよい情報だけ。暗号文・IV は含めない。 */
+export interface PayloadMeta {
+  type: PayloadType;
+  /** 暗号文のバイト数。 */
+  size: number;
+  /** 有効期限（epoch ms）。 */
+  expiresAt: number;
+  /** 鍵確認値（任意）。StoredPayload.keyCheck 参照。 */
+  keyCheck?: string;
 }
 
 export interface PayloadStore {
   /** 保存する。有効期限は ttlSeconds 後（時刻の基準は保存側が持つ）。既存 ID は上書きしない。 */
   put(id: string, payload: StoredPayload, ttlSeconds: number): Promise<{ expiresAt: number }>;
+  /**
+   * メタ情報だけを返す。削除も有効期限の変更もしない（副作用なし）。
+   * 存在しない・期限切れ・取得済みはすべて null（区別しない）。
+   */
+  stat(id: string): Promise<PayloadMeta | null>;
   /**
    * 取得と削除を不可分に行う。存在しない・期限切れ・取得済みはすべて null（区別しない）。
    * 戻り値を返した時点で、ストアからは既に完全に削除されている。
@@ -87,6 +120,17 @@ export class InMemoryPayloadStore implements PayloadStore {
     this.#entries.set(id, { payload, expiresAt, bytes });
     this.#totalBytes += bytes;
     return { expiresAt };
+  }
+
+  async stat(id: string): Promise<PayloadMeta | null> {
+    // 読み取り専用。期限切れでもここでは削除しない（削除は take / purgeExpired / put の役目）。
+    const entry = this.#entries.get(id);
+    if (entry === undefined || entry.expiresAt <= this.#now()) return null;
+    const { type, ciphertext, keyCheck } = entry.payload;
+    // keyCheck が無い保存分は、戻り値にもキー自体を持たせない（後方互換を型のレベルでも保つ）。
+    return keyCheck === undefined
+      ? { type, size: ciphertext.byteLength, expiresAt: entry.expiresAt }
+      : { type, size: ciphertext.byteLength, expiresAt: entry.expiresAt, keyCheck };
   }
 
   async take(id: string): Promise<StoredPayload | null> {

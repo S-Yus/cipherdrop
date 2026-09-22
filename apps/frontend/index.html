@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#09090b" />
+    <!-- 共有リンクのフラグメント（鍵）を含め、遷移先に一切の参照元情報を渡さない -->
+    <meta name="referrer" content="no-referrer" />
+    <!-- 共有リンクは検索エンジンに載せない -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CipherDrop</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>
+      <div class="mx-auto mt-16 max-w-xl rounded-lg border border-zinc-800 bg-zinc-900/50 p-5 text-zinc-100">
+        <p class="font-semibold">JavaScript が必要です</p>
+        <p class="mt-1 text-sm text-zinc-400">暗号化と復号はブラウザ内で実行されます。JavaScript を有効にしてください。</p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

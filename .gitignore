@@ -10,3 +10,6 @@ coverage/
 
 *.log
 .DS_Store
+
+# ビルド検査（tests/build-output.test.ts）の一時出力
+apps/frontend/dist-test/

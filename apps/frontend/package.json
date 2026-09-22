@@ -5,11 +5,18 @@
   "description": "CipherDrop client: all encryption and decryption happens in the browser (Web Crypto API).",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
-    "test": "node --test \"src/**/*.test.ts\""
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json && tsc -p tsconfig.node.json",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
     "@types/jsdom": "30.0.0",
-    "jsdom": "30.1.0"
+    "jsdom": "30.1.0",
+    "tailwindcss": "4.3.3",
+    "vite": "8.3.0"
   }
 }

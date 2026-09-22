@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+/*
+ * デザインは Tailwind の標準パレットだけで構成する（独自の色トークンは持たない）。
+ *   背景 zinc-950 / 面 zinc-900/50 + 1px の zinc-800 / 文字 zinc-100・400 / アクセント emerald と白のみ / 警告 amber
+ * ダーク固定（color-scheme: dark）。影・グラデーションは使わない（tests/design-rules.test.ts が検査する）。
+ */
+@theme {
+  /* 外部フォントは読み込まない（第三者への通信を発生させない）。日本語は OS 標準の和文フォントを使う。 */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic UI", "Noto Sans JP", "Noto Sans CJK JP", "IPAexGothic", Meiryo, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", "Noto Sans Mono CJK JP",
+    "IPAexGothic", "Yu Gothic UI", Meiryo, monospace;
+}
+
+@layer base {
+  html {
+    @apply bg-zinc-950 text-zinc-100;
+    color-scheme: dark; /* フォーム部品・スクロールバーなどブラウザ標準の UI もダークにする */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply min-h-dvh font-sans text-[15px] leading-relaxed antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /*
+   * 日本語の折り返し。既定だと「一|度」「サ|ーバー」のように語の途中で改行され、長音記号「ー」が行頭に来る。
+   *   auto-phrase   文節（フレーズ）の区切りで改行する（Chromium 系。未対応のブラウザは無視して通常の折り返し）
+   *   line-break    小書きのかな・「ー」を行頭にしない
+   *   text-wrap     段落末の孤立（1 文字だけの行）を避ける
+   */
+  html:lang(ja) {
+    word-break: auto-phrase;
+    line-break: strict;
+  }
+
+  p,
+  li,
+  dd {
+    text-wrap: pretty;
+  }
+
+  /* キーボード操作の現在位置を、すべての操作部品でくっきり示す。 */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-emerald-500;
+  }
+
+  /* 入力欄は枠線に沿った詰めたリングにする（オフセットなし）。 */
+  textarea:focus-visible,
+  input:focus-visible,
+  select:focus-visible {
+    @apply outline-offset-0;
+  }
+
+  ::selection {
+    @apply bg-emerald-500/30 text-white;
+  }
+
+  textarea,
+  input,
+  button,
+  select {
+    font: inherit;
+  }
+}
+
+/* OS の「視差効果を減らす」設定を尊重する。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

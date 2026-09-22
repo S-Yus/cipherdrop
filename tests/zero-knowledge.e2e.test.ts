@@ -12,14 +12,10 @@
  */
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import type { AddressInfo, Socket } from 'node:net';
 import { describe, it } from 'node:test';
-import type { TestContext } from 'node:test';
-import { HEADER_IV, createServer } from '../apps/backend/src/server.ts';
-import type { LogEvent } from '../apps/backend/src/server.ts';
-import { InMemoryPayloadStore } from '../apps/backend/src/store.ts';
-import type { StoredPayload } from '../apps/backend/src/store.ts';
-import { CipherDropCryptoError, base64UrlDecode, base64UrlEncode, decryptData, encryptData } from '../apps/frontend/src/crypto.ts';
+import { HEADER_IV, HEADER_KEY_CHECK, HEADER_TYPE } from '../apps/backend/src/server.ts';
+import { CipherDropCryptoError, base64UrlDecode, base64UrlEncode, decryptData, encryptData, generateKeyCheckTag } from '../apps/frontend/src/crypto.ts';
+import { RecordingStore, leakedForms, parseHttpRequests, startWorld } from './support/world.ts';
 
 const SHARE_ORIGIN = 'https://cipherdrop.io';
 
@@ -27,13 +23,19 @@ const SHARE_ORIGIN = 'https://cipherdrop.io';
 // 利用サンプル: 送信者と受信者のブラウザが行う処理
 // ---------------------------------------------------------------------------
 
-/** 送信者: 暗号化 → 暗号文と IV だけを送信 → 共有 URL（鍵は # 以降）を組み立てる。 */
+/** 送信者: 暗号化 → 暗号文・IV・鍵確認値だけを送信 → 共有 URL（鍵は # 以降）を組み立てる。 */
 async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Promise<string> {
   const { encryptedData, iv, keyString } = await encryptData(payload);
+  const keyCheck = await generateKeyCheckTag(keyString); // 鍵から一方向に導出した短いタグ（鍵そのものではない）
 
   const response = await fetch(`${apiOrigin}/api/payload`, {
     method: 'POST',
-    headers: { 'content-type': 'application/octet-stream', [HEADER_IV]: base64UrlEncode(iv) },
+    headers: {
+      'content-type': 'application/octet-stream',
+      [HEADER_IV]: base64UrlEncode(iv),
+      [HEADER_TYPE]: typeof payload === 'string' ? 'text' : 'file', // 確認画面の表示用ヒント（暗号化されない）
+      [HEADER_KEY_CHECK]: keyCheck,
+    },
     body: encryptedData,
   });
   assert.equal(response.status, 201);
@@ -42,14 +44,25 @@ async function sendSecret(apiOrigin: string, payload: string | ArrayBuffer): Pro
   return `${SHARE_ORIGIN}/v/${id}#${keyString}`;
 }
 
-/** 受信者: 共有 URL から ID と鍵を取り出し → 暗号文を取得（サーバー側で削除される）→ 復号する。 */
+/**
+ * 受信者: 共有 URL から ID と鍵を取り出し、2 段階で取得して復号する。
+ *   Stage 1 確認  … GET  /meta     ページ読み込み時。何も消費しない
+ *   Stage 2 消費  … POST /consume  受信者が「開く」を押したときだけ。返す前にサーバー側で削除される
+ * フラグメントを付けたまま fetch に渡しても、ブラウザと同様に HTTP リクエストへは載らない。
+ *
+ * 簡略化のため、ここでは meta.keyCheck の照合はしない（その安全機構は views/receive.ts の
+ * 実装対象で、receive.test.ts / ui-flow.e2e.test.ts が検証している）。この関数は 2 段階 API 自体の
+ * 利用例に絞っている。
+ */
 async function receiveSecret(apiOrigin: string, shareUrl: string): Promise<string | ArrayBuffer> {
   const link = new URL(shareUrl);
   const id = link.pathname.split('/').pop() ?? '';
   const keyString = link.hash.slice(1);
 
-  // フラグメントを付けたまま渡しても、fetch はブラウザと同様に HTTP リクエストへ載せない。
-  const response = await fetch(`${apiOrigin}/api/payload/${id}${link.hash}`);
+  const meta = await fetch(`${apiOrigin}/api/payload/${id}/meta${link.hash}`);
+  if (meta.status !== 200) throw new Error(`fetch failed with status ${meta.status}`);
+
+  const response = await fetch(`${apiOrigin}/api/payload/${id}/consume${link.hash}`, { method: 'POST' });
   if (response.status !== 200) throw new Error(`fetch failed with status ${response.status}`);
 
   const iv = base64UrlDecode(response.headers.get(HEADER_IV) ?? '');
@@ -61,16 +74,6 @@ async function receiveSecret(apiOrigin: string, shareUrl: string): Promise<strin
 // 観測用の部品
 // ---------------------------------------------------------------------------
 
-/** サーバーが保存した内容を記録するストア。 */
-class RecordingStore extends InMemoryPayloadStore {
-  readonly puts: StoredPayload[] = [];
-
-  override async put(id: string, payload: StoredPayload, ttlSeconds: number) {
-    this.puts.push({ ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv) });
-    return super.put(id, payload, ttlSeconds);
-  }
-}
-
 /** 取得時に暗号文を 1 ビット書き換える、悪意あるサーバーのストア。 */
 class TamperingStore extends RecordingStore {
   override async take(id: string) {
@@ -78,74 +81,8 @@ class TamperingStore extends RecordingStore {
     if (payload === null) return null;
     const ciphertext = new Uint8Array(payload.ciphertext);
     ciphertext[0] = (ciphertext[0] ?? 0) ^ 0x01;
-    return { ciphertext, iv: payload.iv };
+    return { ciphertext, iv: payload.iv, type: payload.type };
   }
-}
-
-async function startWorld<S extends RecordingStore = RecordingStore>(t: TestContext, createStore?: () => S) {
-  const store = createStore ? createStore() : (new RecordingStore({ sweepIntervalMs: 0 }) as S);
-  const logs: LogEvent[] = [];
-  const wire: Buffer[] = []; // サーバーが全接続で受信した生バイト列
-
-  const server = createServer({ store, log: (event) => logs.push(event) });
-  server.on('connection', (socket: Socket) => {
-    socket.on('data', (chunk: Buffer) => wire.push(chunk));
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(async () => {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    store.close();
-  });
-
-  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  return { origin, store, logs, observedOnWire: () => Buffer.concat(wire) };
-}
-
-interface ObservedRequest {
-  method: string;
-  target: string;
-  /** リクエスト行 + ヘッダー部（本文を含まない）。 */
-  head: string;
-  /** ヘッダー名は小文字。 */
-  headers: Map<string, string>;
-  body: Buffer;
-}
-
-/** 記録した生ストリームを HTTP/1.1 リクエストの列として読む（本文は Content-Length で切り出す）。 */
-function parseHttpRequests(stream: Buffer): ObservedRequest[] {
-  const requests: ObservedRequest[] = [];
-  let offset = 0;
-  while (offset < stream.length) {
-    const headEnd = stream.indexOf('\r\n\r\n', offset);
-    assert.ok(headEnd >= 0, '途中で切れたリクエストが記録されている');
-
-    const head = stream.subarray(offset, headEnd).toString('latin1');
-    const [requestLine = '', ...headerLines] = head.split('\r\n');
-    const [method = '', target = ''] = requestLine.split(' ');
-    const headers = new Map<string, string>();
-    for (const line of headerLines) {
-      const colon = line.indexOf(':');
-      headers.set(line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim());
-    }
-
-    const bodyStart = headEnd + 4;
-    const bodyLength = Number(headers.get('content-length') ?? 0);
-    requests.push({ method, target, head, headers, body: stream.subarray(bodyStart, bodyStart + bodyLength) });
-    offset = bodyStart + bodyLength;
-  }
-  return requests;
-}
-
-/** 秘密の値が、よくある符号化のどれかで観測データに含まれていないかを返す。 */
-function leakedForms(observed: Buffer, secret: Buffer, label: string): string[] {
-  const forms: Array<[string, Buffer | string]> = [
-    [`${label} (raw)`, secret],
-    [`${label} (hex)`, secret.toString('hex')],
-    [`${label} (base64)`, secret.toString('base64')],
-    [`${label} (base64url)`, secret.toString('base64url')],
-  ];
-  return forms.filter(([, needle]) => observed.includes(needle)).map(([name]) => name);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,10 +111,11 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     const keyString = link.hash.slice(1);
     const id = link.pathname.split('/').pop() ?? '';
 
-    // 共有リンクを開いたブラウザがサーバーへ送る 2 種類のリクエスト:
+    // 共有リンクを開いたブラウザがサーバーへ送るリクエスト:
     //  1. ページの取得（GET /v/{id}#{key}）… このテスト用サーバーは API だけなので 404 だが、送信内容は記録される
     await fetch(`${world.origin}${link.pathname}${link.hash}`);
-    //  2. ページ上の JS による暗号文の取得（フラグメント付きのまま fetch に渡す）
+    //  2. ページ上の JS による確認（GET …/meta）と、受信者が「開く」を押したときの消費（POST …/consume）
+    //     いずれもフラグメント付きのまま fetch に渡す
     assert.equal(await receiveSecret(world.origin, shareUrl), message);
 
     const observed = world.observedOnWire();
@@ -190,18 +128,22 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     const requests = parseHttpRequests(observed);
 
     // --- 陽性対照: 記録の仕組みが空振りしていないこと（見えるべきものは見えている）---
-    // サーバーが受け取ったリクエストは、この 3 本だけ。パスに鍵はなく、クエリもフラグメントもない。
+    // サーバーが受け取ったリクエストは、この 4 本だけ。パスに鍵はなく、クエリもフラグメントもない。
     assert.deepEqual(
       requests.map((r) => `${r.method} ${r.target}`),
-      ['POST /api/payload', `GET /v/${id}`, `GET /api/payload/${id}`],
+      ['POST /api/payload', `GET /v/${id}`, `GET /api/payload/${id}/meta`, `POST /api/payload/${id}/consume`],
     );
     const [upload] = requests;
     assert.ok(upload);
     assert.deepEqual(new Uint8Array(upload.body), stored.ciphertext, 'アップロード本文は暗号文そのもの');
     assert.equal(upload.headers.get(HEADER_IV), base64UrlEncode(stored.iv), 'IV はヘッダーに現れる');
-    assert.deepEqual(requests.slice(1).map((r) => r.body.length), [0, 0], 'GET は本文を持たない');
+    assert.equal(upload.headers.get(HEADER_TYPE), 'text', '種別ヒントはヘッダーに現れる（表示専用の情報）');
+    const expectedKeyCheck = await generateKeyCheckTag(keyString);
+    assert.equal(upload.headers.get(HEADER_KEY_CHECK), expectedKeyCheck, '鍵確認値はヘッダーに現れる（鍵ではなく、鍵から導出した 8 桁の値）');
+    assert.equal(stored.keyCheck, expectedKeyCheck, '保存された値も同じ（サーバーは意味を解釈せずそのまま保存する）');
+    assert.deepEqual(requests.slice(1).map((r) => r.body.length), [0, 0, 0], '2 件目以降は本文を持たない');
 
-    // --- 通信: 鍵はどんな形でも現れない ---
+    // --- 通信: 鍵はどんな形でも現れない（鍵確認値ヘッダーを含めて検査する）---
     const rawKey = Buffer.from(keyString, 'base64url');
     assert.equal(rawKey.length, 32);
     assert.deepEqual(leakedForms(observed, rawKey, '鍵'), []);
@@ -211,6 +153,9 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     for (let i = 0; i + 12 <= keyString.length; i++) {
       assert.ok(!text.includes(keyString.slice(i, i + 12)), `鍵の一部 (${i}〜) が通信に現れている`);
     }
+    // 上の leakedForms(observed, rawKey, …) は、通信の生バイト列全体（新しい鍵確認値ヘッダーを含む）を
+    // 対象にしている。鍵確認値ヘッダー自体も 32bit・16進 8 桁の短い値で、鍵の符号化ではない。
+    assert.equal(expectedKeyCheck.length, 8);
 
     // --- 通信: 平文もどんな形でも現れない ---
     assert.deepEqual(leakedForms(observed, Buffer.from(message), '平文'), []);
@@ -218,10 +163,11 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
       assert.ok(!observed.includes(fragment), `平文の断片 "${fragment}" が通信に現れている`);
     }
 
-    // --- 保存: サーバーが持っていたのは暗号文と IV だけで、そこにも鍵・平文はない ---
+    // --- 保存: サーバーが持っていたのは暗号文・IV・種別ヒント・鍵確認値（32bit）だけで、鍵・平文はない ---
     assert.equal(world.store.puts.length, 1);
-    assert.deepEqual(Object.keys(stored).sort(), ['ciphertext', 'iv']);
-    const storedBytes = Buffer.concat([stored.ciphertext, stored.iv]);
+    assert.deepEqual(Object.keys(stored).sort(), ['ciphertext', 'iv', 'keyCheck', 'type']);
+    assert.equal(stored.type, 'text');
+    const storedBytes = Buffer.concat([stored.ciphertext, stored.iv, Buffer.from(stored.keyCheck ?? '', 'utf8')]);
     assert.deepEqual(leakedForms(storedBytes, rawKey, '鍵'), []);
     assert.deepEqual(leakedForms(storedBytes, Buffer.from(message), '平文'), []);
 
@@ -239,7 +185,7 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
     const keyString = link.hash.slice(1);
     const id = link.pathname.split('/').pop() ?? '';
 
-    const buggy = await fetch(`${world.origin}/api/payload/${id}?key=${keyString}`); // NG な実装
+    const buggy = await fetch(`${world.origin}/api/payload/${id}/consume?key=${keyString}`, { method: 'POST' }); // NG な実装
     assert.equal(buggy.status, 400);
     assert.ok(world.observedOnWire().includes(keyString), '鍵が漏れる実装なら、この検査方法で検出できる');
     assert.equal(world.store.size, 1, '拒否されたので暗号文は消費されていない');
@@ -256,6 +202,29 @@ describe('E2E: Zero-Knowledge・1 回読み切り', () => {
 
     assert.ok(received instanceof ArrayBuffer);
     assert.deepEqual(new Uint8Array(received), new Uint8Array(file));
+    assert.equal(world.store.puts[0]?.type, 'file', 'ArrayBuffer は種別ヒント file で保存される');
+    await assert.rejects(receiveSecret(world.origin, shareUrl), /status 404/);
+  });
+
+  it('リンクプレビュー・クローラーがリンク先を先に叩いても消えず、受信者は最後まで開ける（2 段階の要）', async (t) => {
+    const world = await startWorld(t);
+    const shareUrl = await sendSecret(world.origin, message);
+    const link = new URL(shareUrl);
+    const id = link.pathname.split('/').pop() ?? '';
+
+    // チャットアプリのプレビュー生成・セキュリティスキャナ・プロキシの疎通確認が行うアクセス。
+    // 旧仕様（GET で消滅）ならここで消えていた。
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${world.origin}${link.pathname}`); // ページ（# 以降は元々送られない）
+      await fetch(`${world.origin}${link.pathname}`, { method: 'HEAD' });
+      await fetch(`${world.origin}/api/payload/${id}/meta`); // ページ内の JS を実行するスキャナ
+      await fetch(`${world.origin}/api/payload/${id}`); // 旧仕様の URL（廃止済み）
+      await fetch(`${world.origin}/api/payload/${id}/consume`); // GET では消費されない
+    }
+    assert.equal(world.store.size, 1, 'プレビューが何度来ても、データは残っている');
+
+    assert.equal(await receiveSecret(world.origin, shareUrl), message, '受信者が「開く」を押せば読める');
+    assert.equal(world.store.size, 0);
     await assert.rejects(receiveSecret(world.origin, shareUrl), /status 404/);
   });
 

@@ -1,0 +1,9 @@
+{
+  // Vite の設定ファイル（Node 上で実行される）用。
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": ["vite.config.ts"]
+}
