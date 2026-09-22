@@ -4,6 +4,7 @@
  *   POST /api/payload              暗号文を保存し、ID を発行する
  *   GET  /api/payload/:id/meta     メタ情報（種別・サイズ・有効期限）だけを返す。何も消費しない
  *   POST /api/payload/:id/consume  暗号文と IV を返し、返す前にストアから完全に削除する
+ *   GET  /api/payload/ping         ヘルスチェック専用。ストアに触れず 200 {"status":"ok"} を返すだけ
  *
  * 取得を「確認（meta）」と「消費（consume）」の 2 段階に分けているのは、リンクプレビュー・クローラー・
  * セキュリティスキャナが URL を GET しても、受信者が開く前にデータが消えないようにするため。
@@ -41,6 +42,8 @@ export const HEADER_TYPE = 'x-cipherdrop-type';
 export const HEADER_KEY_CHECK = 'x-cipherdrop-key-check';
 
 const CREATE_PATH = '/api/payload';
+/** ヘルスチェック専用。コンテナ・ロードバランサが「HTTP サーバーが応答するか」だけを見る。何も消費しない。 */
+const PING_PATH = '/api/payload/ping';
 const ITEM_PATH = /^\/api\/payload\/([A-Za-z0-9_-]{22})\/(meta|consume)$/; // ID は 128bit = base64url 22 文字
 const ID_BYTES = 16;
 const IV_HEADER_PATTERN = /^[A-Za-z0-9_-]{16}$/; // 12 バイト = base64url 16 文字
@@ -52,13 +55,20 @@ export const DEFAULT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 export const DEFAULT_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-/** すべてのレスポンスに付ける。API は HTML を返さないので CSP は全拒否。CORS は意図的に許可しない。 */
+/**
+ * すべてのレスポンスに付ける。API は HTML を返さないので CSP は全拒否。CORS は意図的に許可しない。
+ * HSTS はこのプロセス自身が TLS を扱わない（本番は配信側でリバースプロキシ経由）場合も付けてよい:
+ * 仕様上ブラウザは HTTP 経由で届いた Strict-Transport-Security を無視するので、直接叩いた開発時は
+ * 無害。配信側（nginx 等）を経由して HTTPS で届いたときに初めて効く（多層防御。deploy/security-headers.conf も参照）。
+ */
 const BASE_HEADERS = {
   'Cache-Control': 'no-store', // 暗号文であってもキャッシュさせない（1 回読み切りの前提が崩れる）
   'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
   'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
   'Cross-Origin-Resource-Policy': 'same-origin',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -69,7 +79,7 @@ const BASE_HEADERS = {
 // このファイルでの console.* の使用も tests/security-policy.test.ts が禁止している。
 // ---------------------------------------------------------------------------
 
-export type RouteName = 'create' | 'meta' | 'consume' | 'unmatched';
+export type RouteName = 'create' | 'meta' | 'consume' | 'health' | 'unmatched';
 
 export type LogEvent =
   | { event: 'request'; method: string; route: RouteName; status: number; durationMs: number }
@@ -184,6 +194,16 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, context: Cont
       await createPayload(req, res, context);
     }
     return 'create';
+  }
+
+  // ヘルスチェック: ストアにも暗号文にも一切触れない。GET 以外は 405。
+  if (target === PING_PATH) {
+    if (req.method !== 'GET') {
+      sendError(res, 405, 'method_not_allowed', { Allow: 'GET' });
+    } else {
+      sendJson(res, 200, { status: 'ok' });
+    }
+    return 'health';
   }
 
   const item = ITEM_PATH.exec(target);

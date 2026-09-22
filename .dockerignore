@@ -1,0 +1,39 @@
+# ビルドコンテキストから除外する（イメージのビルド速度・サイズと、秘密情報の混入防止のため）。
+# Dockerfile が明示的に COPY するファイル（package.json 群・apps/*・tsconfig.base.json・deploy/*）
+# だけがコンテキストに残ればよい。
+
+# 依存関係（コンテナ内で npm ci が入れ直す。ホストのバイナリを持ち込まない）
+node_modules
+**/node_modules
+
+# バージョン管理・エディタ・OS のメタデータ
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+
+# ビルド成果物（コンテナ内で作り直す）・型チェックのキャッシュ
+dist
+**/dist
+apps/frontend/dist-test
+*.tsbuildinfo
+
+# ログ・カバレッジ
+*.log
+npm-debug.log*
+coverage
+
+# 秘密情報（.env は .gitignore と同様、絶対にイメージへ焼き込まない）
+.env
+.env.*
+!.env.example
+
+# Docker 自身の設定（イメージの中に Dockerfile 自体を含める必要はない）
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# ドキュメント（無くてもビルド・実行に影響しない）
+README.md

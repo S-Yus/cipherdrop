@@ -1,0 +1,40 @@
+# ローカル検証・本番運用の両方で使う compose 定義。
+#
+#   app         CipherDrop 本体（ルートの Dockerfile。nginx が静的配信 + /api リバースプロキシ、
+#               同じコンテナ内の node がバックエンド）。
+#   cloudflared Cloudflare Tunnel。公開ポートを一切開けずに、Cloudflare のエッジから app へ中継する。
+#               自宅サーバーや NAT の背後でも、ルーターのポート開放が要らない。
+#
+# 使い方:
+#   1. .env.example を .env にコピーし、TUNNEL_TOKEN を設定する
+#      （Cloudflare Zero Trust ダッシュボード → Networks → Tunnels → 作成したトンネルの「トークンを
+#      コピー」）。トンネルの Public Hostname は、送信先（Service）を http://app:8080 に向ける
+#      （app はこの compose 内のサービス名。同じネットワーク上なのでそのまま名前解決できる）。
+#   2. docker compose up -d --build
+#   3. ローカル確認: curl http://127.0.0.1:8080/api/payload/ping → {"status":"ok"}
+#      本番: トンネルに設定したホスト名（例 https://cipherdrop.io）でアクセスできる。
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # ループバックのみに公開する（ローカルでの疎通確認・診断用）。
+      # 外部からの到達経路は cloudflared だけにする（0.0.0.0 には一切公開しない）。
+      - "127.0.0.1:8080:8080"
+    # ヘルスチェックは Dockerfile 側で定義済み（GET /api/payload/ping、ストアに触れない）。
+    # 下の cloudflared は、これが healthy になるまで起動を待つ。
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.1
+    restart: unless-stopped
+    # コンテナ内でバイナリを勝手に自動更新させない（イメージのバージョンはこちらで管理する）。
+    command: tunnel --no-autoupdate run
+    environment:
+      # 未設定だと分かりにくいエラーで落ちるより先に、ここで気づけるようにする。
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?TUNNEL_TOKEN を .env に設定してください（.env.example を参照）}
+    depends_on:
+      app:
+        condition: service_healthy

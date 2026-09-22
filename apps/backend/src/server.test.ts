@@ -644,6 +644,56 @@ describe('POST /api/payload/:id/consume', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/payload/ping （ヘルスチェック。Docker HEALTHCHECK が叩く）
+// ---------------------------------------------------------------------------
+
+describe('GET /api/payload/ping', () => {
+  it('200 {"status":"ok"} を返す。ストアには一切触れない（stat も take も呼ばない）', async (t) => {
+    const h = await startHarness(t);
+    await createSecret(h); // ストアに何か入っていても、無関係に応答することを確認する
+
+    const response = await fetch(`${h.baseUrl}/api/payload/ping`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { status: 'ok' });
+    assert.equal(h.store.stats.length, 0);
+    assert.equal(h.store.takes.length, 0);
+    assert.equal(h.store.size, 1, 'ping の前後でストアの中身は変わらない');
+  });
+
+  it('何度呼んでも同じ応答（副作用が無いことを繰り返しで確認する）', async (t) => {
+    const h = await startHarness(t);
+    const responses = await Promise.all(Array.from({ length: 50 }, () => fetch(`${h.baseUrl}/api/payload/ping`)));
+    for (const response of responses) {
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { status: 'ok' });
+    }
+    assert.equal(h.store.stats.length, 0);
+    assert.equal(h.store.takes.length, 0);
+  });
+
+  it('GET 以外は 405（Allow: GET）', async (t) => {
+    const h = await startHarness(t);
+    for (const method of ['POST', 'HEAD', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']) {
+      const response = await fetch(`${h.baseUrl}/api/payload/ping`, { method });
+      assert.equal(response.status, 405, method);
+      assert.equal(response.headers.get('allow'), 'GET');
+    }
+  });
+
+  it('クエリ付きは 400 で拒否する（他のエンドポイントと同じ規則）', async (t) => {
+    const h = await startHarness(t);
+    const response = await fetch(`${h.baseUrl}/api/payload/ping?x=1`);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'query_not_allowed' });
+  });
+
+  it('22 文字の ID と衝突しない（"ping" は ID の形式・長さに一致しない）', () => {
+    assert.notEqual('ping'.length, 22);
+    assert.doesNotMatch('ping', /^[A-Za-z0-9_-]{22}$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2 段階仕様の要: 受信者が開く前に消えない
 // ---------------------------------------------------------------------------
 
@@ -767,13 +817,16 @@ describe('レスポンスヘッダー', () => {
       await getMeta(h, secret.id), // 404
       await fetch(`${h.baseUrl}/nope`), // 404
       await fetch(`${h.baseUrl}/api/payload`, { method: 'OPTIONS', headers: { origin: 'https://evil.example' } }), // 405
+      await fetch(`${h.baseUrl}/api/payload/ping`), // 200
     ];
     for (const response of responses) {
       assert.equal(response.headers.get('cache-control'), 'no-store', `${response.status}`);
       assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(response.headers.get('x-frame-options'), 'DENY');
       assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
       assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'");
       assert.equal(response.headers.get('cross-origin-resource-policy'), 'same-origin');
+      assert.equal(response.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains; preload');
       assert.equal(response.headers.get('access-control-allow-origin'), null, 'CORS は許可しない（同一オリジン運用）');
       await response.arrayBuffer();
     }
