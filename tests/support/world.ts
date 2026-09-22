@@ -22,8 +22,14 @@ export class RecordingStore extends InMemoryPayloadStore {
     // keyCheck が無ければキー自体を持たせない（記録が、実際に保存される形をそのまま映す）。
     const recorded: StoredPayload =
       payload.keyCheck === undefined
-        ? { ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type }
-        : { ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type, keyCheck: payload.keyCheck };
+        ? { ciphertext: new Uint8Array(payload.ciphertext), iv: new Uint8Array(payload.iv), type: payload.type, consumeVerifier: new Uint8Array(payload.consumeVerifier) }
+        : {
+            ciphertext: new Uint8Array(payload.ciphertext),
+            iv: new Uint8Array(payload.iv),
+            type: payload.type,
+            keyCheck: payload.keyCheck,
+            consumeVerifier: new Uint8Array(payload.consumeVerifier),
+          };
     this.puts.push(recorded);
     return super.put(id, payload, ttlSeconds);
   }
@@ -33,9 +39,9 @@ export class RecordingStore extends InMemoryPayloadStore {
     return super.stat(id);
   }
 
-  override async take(id: string) {
+  override async take(id: string, consumeSecret: Uint8Array) {
     this.takes.push(id);
-    return super.take(id);
+    return super.take(id, consumeSecret);
   }
 }
 

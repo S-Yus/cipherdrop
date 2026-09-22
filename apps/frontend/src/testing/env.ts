@@ -23,7 +23,7 @@ export interface TestEnvOptions {
 export type ApiCall =
   | { method: 'createPayload'; args: Parameters<ApiClient['createPayload']> }
   | { method: 'getMeta'; args: [string] }
-  | { method: 'consume'; args: [string] };
+  | { method: 'consume'; args: [string, string] };
 
 export function createTestEnv(options: TestEnvOptions = {}) {
   const dom = new JSDOM('<!doctype html><html lang="ja"><head><title></title></head><body><div id="app"></div></body></html>', {
@@ -46,9 +46,9 @@ export function createTestEnv(options: TestEnvOptions = {}) {
       if (options.api?.getMeta) return options.api.getMeta(id);
       throw new ApiError('not_found', 404);
     },
-    async consume(id) {
-      calls.push({ method: 'consume', args: [id] });
-      if (options.api?.consume) return options.api.consume(id);
+    async consume(id, consumeSecret) {
+      calls.push({ method: 'consume', args: [id, consumeSecret] });
+      if (options.api?.consume) return options.api.consume(id, consumeSecret);
       throw new ApiError('not_found', 404);
     },
   };

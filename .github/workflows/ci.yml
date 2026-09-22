@@ -1,0 +1,52 @@
+# main / develop への push・PR を検証するガードレール。
+#
+# 型チェック・全テスト(502件超。AST によるセキュリティポリシー・インフラ整合性テストを含む)・
+# 全ワークスペースのビルド・依存関係の脆弱性監査のいずれか 1 つでも失敗したら、CI 全体を失敗させる。
+#
+# 注意: このワークフロー自体は「実行する」だけで、失敗した PR のマージを止めはしない。
+# main / develop を保護し、このチェックを必須ステータスにするには、リポジトリの
+# Settings → Branches → Branch protection rules で別途設定すること（このファイルの範囲外）。
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# 同じブランチ・PR に新しい push が来たら、古い実行中のジョブは打ち切る（CI 時間の無駄を避ける）。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 既定の GITHUB_TOKEN 権限を必要最小限（チェックアウトのみ）に絞る。
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, test, build, audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x' # import.meta.main 要件（README「始め方」参照）。Dockerfile も node:24-alpine を使う。
+          cache: 'npm' # 単一のルート package-lock.json（npm workspaces）をそのままキャッシュキーに使える。
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck & tests
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Security audit
+        run: npm audit --audit-level=high

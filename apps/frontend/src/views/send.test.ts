@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { ApiError } from '../api.ts';
 import { mountApp } from '../app.ts';
@@ -25,6 +26,12 @@ async function generateLink(t: Opened): Promise<string> {
   click(submitButton(t));
   const block = await waitFor(() => t.main.querySelector('[data-testid="share-link"]'));
   return block.textContent ?? '';
+}
+
+/** 共有リンクの `#` 以降（`{keyString}.{consumeSecret}`）を分解する。 */
+function splitFragment(link: string): { keyString: string; consumeSecretString: string } {
+  const [keyString, consumeSecretString] = (link.split('#')[1] ?? '').split('.');
+  return { keyString: keyString ?? '', consumeSecretString: consumeSecretString ?? '' };
 }
 
 function choose(t: Opened, seconds: number): void {
@@ -133,31 +140,43 @@ describe('送信画面: バイト数の表示（等幅）', () => {
 });
 
 describe('送信画面: テキストの送信', () => {
-  it('暗号化して送信し、リンクを表示する。API に渡るのは暗号文・IV・種別・TTL・鍵確認値だけで、鍵はどこにも現れない', async () => {
+  it('暗号化して送信し、リンクを表示する。API に渡るのは暗号文・IV・種別・TTL・鍵確認値・consumeVerifier だけで、鍵・consumeSecret はどこにも現れない', async () => {
     const t = open();
     const secret = 'パスワードは Tr0ub4dor&3 です';
     typeInto(query<HTMLTextAreaElement>(t.main, '#message'), secret);
 
     const link = await generateLink(t);
-    assert.match(link, new RegExp(`^https://cipherdrop\\.io/v/${SAMPLE_ID}#[A-Za-z0-9_-]{43}$`));
-    const keyString = link.split('#')[1] ?? '';
+    assert.match(link, new RegExp(`^https://cipherdrop\\.io/v/${SAMPLE_ID}#[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{43}$`));
+    const { keyString, consumeSecretString } = splitFragment(link);
 
     assert.equal(t.calls.length, 1);
     const call = t.calls[0];
     assert.ok(call?.method === 'createPayload');
     const input = call.args[0];
-    assert.deepEqual(Object.keys(input).sort(), ['encryptedData', 'iv', 'keyCheck', 'ttlSeconds', 'type'], 'API に渡す項目はこれだけ');
+    assert.deepEqual(
+      Object.keys(input).sort(),
+      ['consumeVerifier', 'encryptedData', 'iv', 'keyCheck', 'ttlSeconds', 'type'],
+      'API に渡す項目はこれだけ',
+    );
     assert.equal(input.type, 'text');
     assert.equal(input.ttlSeconds, 86_400);
     assert.equal(input.iv.byteLength, 12);
     // 鍵確認値は、鍵から一方向に導出した値と一致する（サーバーへは鍵ではなくこれだけが渡る）
     assert.equal(input.keyCheck, await generateKeyCheckTag(keyString));
+    // consumeVerifier は、URL の consumeSecret の SHA-256 全体と一致する（サーバーへは生の値ではなくこれだけが渡る）
+    const rawConsumeSecret = Buffer.from(consumeSecretString, 'base64url');
+    assert.equal(input.consumeVerifier, createHash('sha256').update(rawConsumeSecret).digest('hex'));
 
-    // 鍵は、API に渡ったデータのどの表現にも現れない（鍵確認値も含めて調べる）
-    const sent = Buffer.concat([Buffer.from(input.encryptedData), Buffer.from(input.iv), Buffer.from(input.keyCheck ?? '', 'utf8')]);
+    // 鍵・consumeSecret・平文は、API に渡ったデータのどの表現にも現れない（鍵確認値・consumeVerifier も含めて調べる）
+    const sent = Buffer.concat([
+      Buffer.from(input.encryptedData),
+      Buffer.from(input.iv),
+      Buffer.from(input.keyCheck ?? '', 'utf8'),
+      Buffer.from(input.consumeVerifier, 'utf8'),
+    ]);
     const rawKey = Buffer.from(keyString, 'base64url');
-    for (const needle of [keyString, rawKey, rawKey.toString('hex'), rawKey.toString('base64'), secret]) {
-      assert.equal(sent.includes(needle), false, '鍵・平文が API 引数に含まれている');
+    for (const needle of [keyString, rawKey, rawKey.toString('hex'), rawKey.toString('base64'), secret, consumeSecretString, rawConsumeSecret]) {
+      assert.equal(sent.includes(needle), false, '鍵・consumeSecret・平文が API 引数に含まれている');
     }
 
     // リンクの鍵で、送った暗号文を復号できる（リンクが正しい）
@@ -271,7 +290,7 @@ describe('送信画面: ファイルの送信', () => {
     assert.equal(input.type, 'file');
     assert.equal(Buffer.from(input.encryptedData).includes('診断書'), false, 'ファイル名が暗号文に平文で現れない');
 
-    const decrypted = await decryptPayload(input.encryptedData, input.iv, link.split('#')[1] ?? '');
+    const decrypted = await decryptPayload(input.encryptedData, input.iv, splitFragment(link).keyString);
     assert.ok(decrypted.type === 'file');
     assert.equal(decrypted.name, '山田太郎_診断書.pdf');
     assert.deepEqual(new Uint8Array(decrypted.data), content);
@@ -377,7 +396,7 @@ describe('送信画面: エラー', () => {
       assert.equal(query<HTMLTextAreaElement>(t.main, '#message').value, '大事なテキスト', '入力は失われない');
       assert.equal(submitButton(t).disabled, false);
 
-      assert.match(await generateLink(t), /#[A-Za-z0-9_-]{43}$/, '再送信で成功する');
+      assert.match(await generateLink(t), /#[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/, '再送信で成功する');
     });
   }
 

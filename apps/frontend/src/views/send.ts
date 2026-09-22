@@ -7,7 +7,7 @@
  */
 import { ApiError } from '../api.ts';
 import type { PayloadType } from '../api.ts';
-import { CipherDropCryptoError, encryptData, encryptFile, generateKeyCheckTag } from '../crypto.ts';
+import { CipherDropCryptoError, encryptData, encryptFile, generateConsumeSecret, generateKeyCheckTag } from '../crypto.ts';
 import { createDom, cx } from '../dom.ts';
 import type { AppEnv, ViewHandle } from '../env.ts';
 import { formatBytes, formatDateTime, formatRemaining } from '../format.ts';
@@ -420,17 +420,24 @@ export function mountSendView(env: AppEnv, container: HTMLElement): ViewHandle {
       // 途中欠損で違う内容になった鍵を、消費する前に検出するために使う。
       const keyCheck = await generateKeyCheckTag(encrypted.keyString);
 
+      // consumeSecret: 復号鍵とは独立した、consume（1 回限りの取得・削除）の許可だけを表す秘密。
+      // サーバーには SHA-256（verifierHex）だけを送り、生の値（secretString）は共有 URL にしか載せない。
+      // ID だけを知る第三者が、復号鍵を知らないまま consume してデータを破棄できてしまう問題への対策。
+      const consumeSecret = await generateConsumeSecret();
+
       const { id, expiresAt } = await env.api.createPayload({
         encryptedData: encrypted.encryptedData,
         iv: encrypted.iv,
         type,
         ttlSeconds,
         keyCheck,
+        consumeVerifier: consumeSecret.verifierHex,
       });
       if (destroyed) return;
 
-      // 鍵はここで初めて URL の # 以降に載る。api.ts を通っていないので、サーバーへ送られることはない。
-      const url = `${env.location.origin}/v/${id}#${encrypted.keyString}`;
+      // 鍵と consumeSecret は、ここで初めて URL の # 以降に載る(`.` 区切り)。
+      // api.ts を通っていないので、どちらもサーバーへ送られることはない。
+      const url = `${env.location.origin}/v/${id}#${encrypted.keyString}.${consumeSecret.secretString}`;
       phase = { name: 'done', result: { url, expiresAt, type, fileName, size } };
       pendingFocus = '[data-autofocus]';
     } catch (error) {

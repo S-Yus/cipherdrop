@@ -18,8 +18,8 @@ describe('mountApp: 画面の振り分け', () => {
     assert.equal(t.calls.length, 0);
   });
 
-  it('/v/{id}#key は受取画面（読み込み時に meta を呼ぶ）', () => {
-    const t = open({ url: `https://cipherdrop.io/v/${SAMPLE_ID}#${'A'.repeat(43)}` });
+  it('/v/{id}#key.consumeSecret は受取画面（読み込み時に meta を呼ぶ）', () => {
+    const t = open({ url: `https://cipherdrop.io/v/${SAMPLE_ID}#${'A'.repeat(43)}.${'A'.repeat(43)}` });
     assert.equal(t.doc.title, '受信データ — CipherDrop');
     assert.deepEqual(t.calls.map((call) => call.method), ['getMeta']);
   });
@@ -47,7 +47,7 @@ describe('mountApp: ヘッダーと構造', () => {
   });
 
   it('受取・404 画面のヘッダーには、新しい共有を始める「新規共有」リンクが 1 つだけある', () => {
-    for (const url of [`https://cipherdrop.io/v/${SAMPLE_ID}#${'A'.repeat(43)}`, 'https://cipherdrop.io/nope']) {
+    for (const url of [`https://cipherdrop.io/v/${SAMPLE_ID}#${'A'.repeat(43)}.${'A'.repeat(43)}`, 'https://cipherdrop.io/nope']) {
       const t = open({ url });
       const links = [...t.doc.querySelectorAll('header a')].map((a) => `${a.textContent}→${a.getAttribute('href')}`);
       assert.deepEqual(links, ['CipherDrop→/', '新規共有→/'], url);

@@ -40,6 +40,18 @@ export const HEADER_TYPE = 'x-cipherdrop-type';
  * このサーバーは値の意味を解釈せず、そのまま保存して meta 応答で返すだけ。
  */
 export const HEADER_KEY_CHECK = 'x-cipherdrop-key-check';
+/**
+ * 消費用の秘密鍵（consumeSecret）の SHA-256（32 バイト・16進小文字 64 桁）。POST /api/payload で必須。
+ * consumeSecret 自体（鍵と同じ base64url・256bit の生の値）はここには含めない。ここに含めるのは
+ * 一方向ハッシュだけで、後で POST …/consume が受け取る HEADER_CONSUME_SECRET と突き合わせて検証する。
+ */
+export const HEADER_CONSUME_VERIFIER = 'x-cipherdrop-consume-verifier';
+/**
+ * 消費用の秘密鍵（consumeSecret）そのもの（base64url・256bit）。POST /api/payload/:id/consume で必須。
+ * ID だけを知る第三者が、復号鍵を知らないまま `consume` を叩いてデータを破棄できてしまう問題への対策
+ * （共有 URL は `/v/{id}#{encKey}.{consumeSecret}` の形をとる。apps/frontend/src/crypto.ts 参照）。
+ */
+export const HEADER_CONSUME_SECRET = 'x-cipherdrop-consume-secret';
 
 const CREATE_PATH = '/api/payload';
 /** ヘルスチェック専用。コンテナ・ロードバランサが「HTTP サーバーが応答するか」だけを見る。何も消費しない。 */
@@ -48,6 +60,8 @@ const ITEM_PATH = /^\/api\/payload\/([A-Za-z0-9_-]{22})\/(meta|consume)$/; // ID
 const ID_BYTES = 16;
 const IV_HEADER_PATTERN = /^[A-Za-z0-9_-]{16}$/; // 12 バイト = base64url 16 文字
 const KEY_CHECK_HEADER_PATTERN = /^[0-9a-f]{8}$/; // SHA-256 の先頭 32bit（16進小文字）
+const CONSUME_VERIFIER_HEADER_PATTERN = /^[0-9a-f]{64}$/; // SHA-256 全体（32 バイト・16進小文字）
+const CONSUME_SECRET_HEADER_PATTERN = /^[A-Za-z0-9_-]{43}$/; // base64url・256bit（鍵と同じ形式）
 const MIN_CIPHERTEXT_BYTES = 16; // AES-GCM の認証タグ長。これ未満は暗号文として成立しない
 const MIN_TTL_SECONDS = 60;
 
@@ -227,7 +241,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, context: Cont
     if (req.method !== 'POST') {
       sendError(res, 405, 'method_not_allowed', { Allow: 'POST' });
     } else {
-      await consumePayload(res, id, context);
+      await consumePayload(req, res, id, context);
     }
     return 'consume';
   }
@@ -257,13 +271,39 @@ async function createPayload(req: IncomingMessage, res: ServerResponse, context:
   // 任意・ヒントのみ: 形式が不正でもリクエスト自体は失敗させず、無いものとして扱う（下の parseKeyCheck）。
   const keyCheck = parseKeyCheck(req.headers[HEADER_KEY_CHECK]);
 
-  const ciphertext = await readBody(req, context.maxPayloadBytes);
-  if (ciphertext === null) return sendError(res, 413, 'payload_too_large', { Connection: 'close' });
+  // consumeVerifier は必須。keyCheck と違い「無ければ無いものとして扱う」ことはできない
+  // （これが無いと、正当な受信者であっても後で consume できるデータを作れてしまう）。
+  const consumeVerifier = parseConsumeVerifier(req.headers[HEADER_CONSUME_VERIFIER]);
+  if (consumeVerifier === null) return sendError(res, 400, 'invalid_consume_verifier');
+
+  // 本文を読み始める前に、宣言された Content-Length を検証し、ストアの容量を予約する。
+  //   - 宣言サイズが上限（maxPayloadBytes）を超える場合: 1 バイトも読まずに 413（既存の挙動を維持）。
+  //   - 上限以下でも、ストアの残り容量（バイト数・件数）が足りない場合: 1 バイトも読まずに 503。
+  // Content-Length が無い・数値でない場合は予約できない（この場合も readBody 側の limit が読み取り量そのものを制限する）。
+  const declaredLength = parseContentLength(req.headers['content-length']);
+  if (declaredLength !== null) {
+    if (declaredLength > context.maxPayloadBytes) return sendError(res, 413, 'payload_too_large', { Connection: 'close' });
+    if (!context.store.reserve(declaredLength)) return sendError(res, 503, 'storage_full', { 'Retry-After': '60' });
+  }
+
+  const result = await readBody(req, context.maxPayloadBytes, declaredLength);
+  // reserve() していた分は、読み取りの成否に関わらずここで解放する。put() の直前（かつ await を挟まない）
+  // ので、release() と put() の間に別のリクエストの reserve()/put() が割り込む余地はない
+  // （store.ts の reserve/release の doc コメント参照）。
+  if (declaredLength !== null) context.store.release(declaredLength);
+
+  if (!result.ok) {
+    return result.reason === 'too_large'
+      ? sendError(res, 413, 'payload_too_large', { Connection: 'close' })
+      : sendError(res, 400, 'content_length_mismatch');
+  }
+  const ciphertext = result.body;
   if (ciphertext.byteLength < MIN_CIPHERTEXT_BYTES) return sendError(res, 400, 'invalid_ciphertext');
 
   const id = randomBytes(ID_BYTES).toString('base64url');
-  // keyCheck が無ければキー自体を持たせない（保存するのは暗号文・IV・種別ヒント・鍵確認値（あれば）だけ）。
-  const stored: StoredPayload = keyCheck === undefined ? { ciphertext, iv, type } : { ciphertext, iv, type, keyCheck };
+  // keyCheck が無ければキー自体を持たせない（保存するのは暗号文・IV・種別ヒント・鍵確認値（あれば）・consumeVerifier）。
+  const stored: StoredPayload =
+    keyCheck === undefined ? { ciphertext, iv, type, consumeVerifier } : { ciphertext, iv, type, keyCheck, consumeVerifier };
   try {
     const { expiresAt } = await context.store.put(id, stored, ttlSeconds);
     sendJson(res, 201, { id, expiresAt: new Date(expiresAt).toISOString() });
@@ -301,20 +341,82 @@ function parseTtl(header: string | string[] | undefined, context: Context): numb
   return seconds >= MIN_TTL_SECONDS && seconds <= context.maxTtlSeconds ? seconds : null;
 }
 
-/** 上限を超えたら読むのを止めて null を返す。宣言サイズ（Content-Length）が上限超過なら 1 バイトも読まない。 */
-async function readBody(req: IncomingMessage, limit: number): Promise<Buffer | null> {
-  const declared = req.headers['content-length'];
-  if (declared !== undefined && Number(declared) > limit) return null;
+/**
+ * consumeVerifier ヘッダー（SHA-256 全体・16進小文字 64 桁）を解析する。POST /api/payload では必須
+ * （keyCheck と異なり、形式不正・省略のどちらも null を返す ―― 呼び出し側でリクエスト全体を拒否すること）。
+ * 戻り値は 32 バイトの生バイト列で、そのまま StoredPayload.consumeVerifier に渡せる。
+ */
+function parseConsumeVerifier(header: string | string[] | undefined): Buffer | null {
+  if (typeof header !== 'string' || !CONSUME_VERIFIER_HEADER_PATTERN.test(header)) return null;
+  return Buffer.from(header, 'hex');
+}
+
+/**
+ * X-CipherDrop-Consume-Secret ヘッダー（base64url・256bit、共有 URL の鍵と同じ形式）を解析する。
+ * POST …/consume では必須。戻り値は 32 バイトの生バイト列で、そのまま store.take() に渡せる。
+ */
+function parseConsumeSecret(header: string | string[] | undefined): Buffer | null {
+  if (typeof header !== 'string' || !CONSUME_SECRET_HEADER_PATTERN.test(header)) return null;
+  return Buffer.from(header, 'base64url');
+}
+
+/**
+ * Content-Length ヘッダーを緩く解析する。無い・数値でない・安全な整数でない場合は null（「宣言なし」）を返す。
+ * ここでの判定はリクエストを拒否する理由にはしない ―― 事前予約（reserve）の最適化に使うだけで、
+ * 実際に読み取るバイト数は、宣言の有無に関わらず readBody 側の limit で必ず制限される。
+ */
+function parseContentLength(header: string | string[] | undefined): number | null {
+  if (typeof header !== 'string' || !/^[0-9]{1,15}$/.test(header)) return null;
+  const value = Number(header);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+type ReadBodyResult = { ok: true; body: Buffer } | { ok: false; reason: 'too_large' | 'length_mismatch' };
+
+/**
+ * リクエスト本文を読み取る。
+ *
+ * declaredLength が分かっている場合（Content-Length が妥当な数値だった場合。呼び出し側で
+ * すでに limit 以下であることと、ストアの容量予約（reserve）が確認済み）は、あらかじめ
+ * ちょうどそのバイト数の Buffer.alloc（ゼロ初期化）を確保し、届いたチャンクを直接コピーしていく。
+ * chunks 配列に貯めてから Buffer.concat で再度確保し直す方式（二重確保）を避けるための最適化。
+ *
+ * allocUnsafe ではなく alloc を使うのは、宣言サイズと実際に届いたバイト数が食い違った場合でも、
+ * 確保した領域に前のリクエストの残骸（プロセスの未初期化メモリ）が紛れ込む余地を残さないため
+ * （速度よりも「暗号文と称して他人のメモリ片を保存してしまう」事故の防止を優先する判断）。
+ *
+ * declaredLength が分からない場合（ヘッダーが無い・数値でない）は、サイズが事前に分からない以上、
+ * 従来どおり chunks 配列に貯めて最後に Buffer.concat する。
+ *
+ * 戻り値の reason:
+ *   - 'too_large'       受信バイト数が limit を超えた（declaredLength が無い場合の唯一の失敗要因）
+ *   - 'length_mismatch' declaredLength はあるのに、実際に届いたバイト数と食い違った
+ *                        （limit 自体は超えていない。呼び出し側は 'too_large' と区別して扱う）
+ */
+async function readBody(req: IncomingMessage, limit: number, declaredLength: number | null): Promise<ReadBodyResult> {
+  // destroyOnReturn: false — 途中で抜けても req（＝ソケット）を破棄しない。破棄するとエラー応答が返せない。
+  const iterator = req.iterator({ destroyOnReturn: false }) as AsyncIterable<Buffer>;
+
+  if (declaredLength !== null) {
+    const buffer = Buffer.alloc(declaredLength);
+    let received = 0;
+    for await (const chunk of iterator) {
+      if (received + chunk.length > declaredLength) return { ok: false, reason: 'length_mismatch' };
+      chunk.copy(buffer, received);
+      received += chunk.length;
+    }
+    if (received !== declaredLength) return { ok: false, reason: 'length_mismatch' }; // 宣言より少なかった（早期終了）
+    return { ok: true, body: buffer };
+  }
 
   const chunks: Buffer[] = [];
   let received = 0;
-  // destroyOnReturn: false — 途中で抜けても req（＝ソケット）を破棄しない。破棄すると 413 が返せない。
-  for await (const chunk of req.iterator({ destroyOnReturn: false }) as AsyncIterable<Buffer>) {
+  for await (const chunk of iterator) {
     received += chunk.length;
-    if (received > limit) return null;
+    if (received > limit) return { ok: false, reason: 'too_large' };
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks, received);
+  return { ok: true, body: Buffer.concat(chunks, received) };
 }
 
 // ---------------------------------------------------------------------------
@@ -334,11 +436,16 @@ async function readMeta(res: ServerResponse, id: string, context: Context): Prom
 // POST /api/payload/:id/consume  （消費。暗号文を返し、返す前に削除する）
 // ---------------------------------------------------------------------------
 
-async function consumePayload(res: ServerResponse, id: string, context: Context): Promise<void> {
-  // 取得と削除は store.take() の中で不可分に完了する。レスポンスは、その完了後にしか書き出さない。
-  // 取得後に通信が切れても暗号文は復元しない（安全側に倒す）。
-  const payload = await context.store.take(id);
-  if (payload === null) return sendError(res, 404, 'not_found'); // 未発行・取得済み・期限切れを区別しない
+async function consumePayload(req: IncomingMessage, res: ServerResponse, id: string, context: Context): Promise<void> {
+  // consumeSecret が無い・形式不正な場合も 404 にする（「未発行・取得済み・期限切れ」と区別しない）。
+  // ID だけを知る第三者に対して「ヘッダーさえ整えれば何かが存在するかどうか分かる」というオラクルを与えないため。
+  const consumeSecret = parseConsumeSecret(req.headers[HEADER_CONSUME_SECRET]);
+  if (consumeSecret === null) return sendError(res, 404, 'not_found');
+
+  // 取得・consumeSecret の検証・削除は store.take() の中で不可分に完了する。
+  // レスポンスは、その完了後にしか書き出さない。取得後に通信が切れても暗号文は復元しない（安全側に倒す）。
+  const payload = await context.store.take(id, consumeSecret);
+  if (payload === null) return sendError(res, 404, 'not_found'); // 未発行・取得済み・期限切れ・秘密鍵不一致を区別しない
 
   send(res, 200, payload.ciphertext, {
     'Content-Type': 'application/octet-stream',

@@ -10,8 +10,10 @@ import {
   decryptPayload,
   encryptData,
   encryptFile,
+  generateConsumeSecret,
   generateKeyCheckTag,
   isValidKeyString,
+  parseShareFragment,
   renderTextSafely,
 } from './crypto.ts';
 
@@ -405,6 +407,81 @@ describe('isValidKeyString', () => {
     }
     assert.equal(isValidKeyString(undefined as unknown as string), false);
     assert.equal(isValidKeyString(null as unknown as string), false);
+  });
+});
+
+describe('parseShareFragment: 共有 URL のフラグメント（#{key}.{consumeSecret}）の分解', () => {
+  it('鍵と consumeSecret の正しい組を分解できる（往復する）', async () => {
+    const { keyString } = await encryptData('x');
+    const { secretString } = await generateConsumeSecret();
+
+    const parsed = parseShareFragment(`${keyString}.${secretString}`);
+    assert.deepEqual(parsed, { keyString, consumeSecret: secretString });
+  });
+
+  it('区切り「.」が無い（旧形式・鍵だけ）は null', async () => {
+    const { keyString } = await encryptData('x');
+    assert.equal(parseShareFragment(keyString), null);
+    assert.equal(parseShareFragment(''), null);
+  });
+
+  it('区切り「.」が 2 個以上ある（3 分割以上になる）場合は null', async () => {
+    const { keyString } = await encryptData('x');
+    const { secretString } = await generateConsumeSecret();
+    assert.equal(parseShareFragment(`${keyString}.${secretString}.extra`), null);
+    assert.equal(parseShareFragment(`${keyString}..${secretString}`), null, '空の中間パーツも 3 分割として拒否する');
+  });
+
+  it('鍵の部分だけが形式不正なら null（consumeSecret が正しくても通さない）', async () => {
+    const { keyString } = await encryptData('x');
+    const { secretString } = await generateConsumeSecret();
+    for (const badKey of ['', 'short', `${keyString}A`, keyString.slice(0, 42)]) {
+      assert.equal(parseShareFragment(`${badKey}.${secretString}`), null, JSON.stringify(badKey));
+    }
+  });
+
+  it('consumeSecret の部分だけが形式不正なら null（鍵が正しくても通さない）', async () => {
+    const { keyString } = await encryptData('x');
+    for (const badSecret of ['', 'short', `${keyString}A`, keyString.slice(0, 42)]) {
+      assert.equal(parseShareFragment(`${keyString}.${badSecret}`), null, JSON.stringify(badSecret));
+    }
+  });
+
+  it('鍵の位置に consumeSecret を、consumeSecret の位置に鍵を置いても形式さえ合えば分解できる（意味の区別は呼び出し側の責任）', async () => {
+    // parseShareFragment 自身は「1 個目が鍵・2 個目が consumeSecret」という位置の意味づけを検証しない
+    // （どちらも同じ base64url・256bit 形式なので、形式だけでは区別できない）。取り違えれば当然、
+    // consume・復号のどちらも失敗するが、それは呼び出し側（send.ts が正しい順で組み立てる）の責務。
+    const { keyString } = await encryptData('x');
+    const { secretString } = await generateConsumeSecret();
+    assert.deepEqual(parseShareFragment(`${secretString}.${keyString}`), { keyString: secretString, consumeSecret: keyString });
+  });
+});
+
+describe('generateConsumeSecret: 消費用秘密鍵（復号鍵とは独立した、consume の許可だけを表す秘密）', () => {
+  it('secretString は鍵と同じ base64url・256bit（43 文字）。verifierHex は SHA-256 全体（16進小文字 64 桁）', async () => {
+    const { secretString, verifierHex } = await generateConsumeSecret();
+    assert.match(secretString, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(isValidKeyString(secretString), true, 'isValidKeyString をそのまま検証に使い回せる形式であること');
+    assert.match(verifierHex, /^[0-9a-f]{64}$/);
+  });
+
+  it('verifierHex は secretString の生バイト列の SHA-256 全体と一致する（node:crypto による独立検証）', async () => {
+    const { secretString, verifierHex } = await generateConsumeSecret();
+    const expected = createHash('sha256').update(Buffer.from(secretString, 'base64url')).digest('hex');
+    assert.equal(verifierHex, expected);
+  });
+
+  it('呼び出しごとに secretString・verifierHex がすべて異なる（200 回で衝突なし）', async () => {
+    const runs = await Promise.all(Array.from({ length: 200 }, () => generateConsumeSecret()));
+    assert.equal(new Set(runs.map((r) => r.secretString)).size, runs.length);
+    assert.equal(new Set(runs.map((r) => r.verifierHex)).size, runs.length);
+  });
+
+  it('暗号鍵（encryptData の keyString）とは無関係に、独立して生成される', async () => {
+    // 同じ乱数源を使い回して鍵と衝突する、といった実装になっていないことの確認（衝突は天文学的に起こらないはずだが、
+    // 「同じ呼び出しから両方を導出している」ような誤実装であれば、この独立呼び出しの比較で偶然一致し得る形にはならない）。
+    const [{ keyString }, { secretString }] = await Promise.all([encryptData('x'), generateConsumeSecret()]);
+    assert.notEqual(keyString, secretString);
   });
 });
 

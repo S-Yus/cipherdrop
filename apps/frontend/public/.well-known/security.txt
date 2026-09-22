@@ -1,0 +1,11 @@
+# CipherDrop security.txt (RFC 9116)
+# https://www.rfc-editor.org/rfc/rfc9116
+#
+# 公開前の TODO: Contact のメールアドレスを実際に発行し、Encryption に PGP 鍵の URL を追加すること。
+# Expires は年 1 回、更新すること（更新を怠ると security.txt 自体が失効した扱いになる）。
+
+Contact: mailto:security@cipherdrop.io
+Policy: https://github.com/S-Yus/cipherdrop/blob/main/SECURITY.md
+Canonical: https://cipherdrop.io/.well-known/security.txt
+Preferred-Languages: ja, en
+Expires: 2027-09-22T00:00:00Z

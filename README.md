@@ -4,25 +4,31 @@ Zero-Knowledge 設計の、**1 回読み切り・自動消滅**型のメッセ�
 暗号化と復号はブラウザで完結し、サーバーは暗号文しか持たない。復号鍵は共有 URL の `#` 以降にだけ存在する。
 
 ```
-https://cipherdrop.io/v/{id}#{key}
-                       └──┬──┘ └─┬─┘
-        サーバーに届く ◀───┘      └───▶ ブラウザの外には出ない（HTTP リクエストに含まれない）
+https://cipherdrop.io/v/{id}#{key}.{consumeSecret}
+                       └──┬──┘ └────────┬────────┘
+        サーバーに届く ◀───┘             └───▶ ブラウザの外には出ない（HTTP リクエストに含まれない）
 ```
+
+`#` 以降には、復号鍵（`key`）とは独立した、consume（1 回限りの取得・削除）を許可するためだけの秘密
+（`consumeSecret`）も `.` 区切りで載る。ID（`{id}`）は URL パスに載るためサーバーのログ等に残り得るが、
+`#` 以降はどちらも残らない。詳細は「消費用秘密鍵」の節を参照。
 
 ## 仕組み（確認 → 消費の 2 段階）
 
 ```
 送信者のブラウザ                  サーバー                          受信者のブラウザ
- 1. 鍵(256bit)・IV を生成
- 2. AES-GCM で暗号化
- 3. POST /api/payload ─────────▶ 暗号文 + IV + 種別ヒントを保存
+ 1. 鍵(256bit)・consumeSecret(256bit)・IV を生成
+ 2. AES-GCM で暗号化。consumeSecret の SHA-256 を算出
+ 3. POST /api/payload ─────────▶ 暗号文 + IV + 種別ヒント
+    （+ consumeSecret の SHA-256）  + consumeVerifier を保存
     ◀────────────── id ────────
- 4. https://cipherdrop.io/v/{id}#{key} を共有 ─────────────────────▶ 5. ページを開く（# 以降は送信されない）
+ 4. https://cipherdrop.io/v/{id}#{key}.{consumeSecret} を共有 ────▶ 5. ページを開く（# 以降は送信されない）
                                                                        ┌ Stage 1 確認
                                  メタ情報だけ返す（何も消費しない）◀─── │ GET  …/meta
                                                                        │ 「一度開くと消滅します」の警告を表示
                                                                        └ 6. 「データを開く」ボタンを押す
-                                 削除してから返す ◀───────────────────── Stage 2 消費: POST …/consume
+                                 consumeSecret を検証してから ◀─────── Stage 2 消費: POST …/consume
+                                 削除してから返す                       （X-CipherDrop-Consume-Secret ヘッダー）
                                  ────────────────────────────────▶ 7. 鍵で復号して表示（ファイルはダウンロード）
                                  （以降は meta も consume も 404）
 ```
@@ -49,6 +55,7 @@ cipherdrop/
 │   │   ├── index.html               #   エントリー（インラインのスクリプト・スタイルなし）
 │   │   ├── vite.config.ts           #   本番ビルドに厳格な CSP を埋め込む / dev の /api 中継
 │   │   ├── public/favicon.svg
+│   │   ├── public/.well-known/security.txt  # RFC 9116。/.well-known/security.txt として配信される
 │   │   └── src/
 │   │       ├── crypto.ts            #   encryptData / decryptData / encryptFile / decryptPayload / renderTextSafely
 │   │       ├── api.ts               #   API クライアント（鍵を受け取れない・応答を検証する）
@@ -57,7 +64,7 @@ cipherdrop/
 │   │       ├── file-name.ts         #   受信ファイル名の無害化
 │   │       ├── download.ts          #   ダウンロード保存（常に octet-stream）
 │   │       ├── views/send.ts        #   送信画面（/）
-│   │       ├── views/receive.ts     #   受取・復号画面（/v/:id#key）
+│   │       ├── views/receive.ts     #   受取・復号画面（/v/:id#key.consumeSecret）
 │   │       └── app.ts / main.ts     #   ヘッダーと画面の振り分け / ブラウザのエントリー
 │   └── backend/                     # API サーバー（ランタイム依存 0）
 │       └── src/
@@ -74,7 +81,12 @@ cipherdrop/
 │   ├── design-rules.test.ts         #   デザイン規則を強制（色・グラデーション・影・コピー・構成）
 │   ├── source-hygiene.test.ts       #   生の制御文字・双方向制御文字（Trojan Source）の混入を禁止
 │   ├── infra.test.ts                #   Dockerfile・nginx・docker-compose を静的に検査（CSP・バージョン等の整合）
+│   ├── ci-workflow.test.ts          #   .github/workflows/ci.yml を静的に検査（Node バージョン・スクリプト名等の整合）
+│   ├── docs-integrity.test.ts       #   法的・セキュリティ文書の存在・必須用語・リンク切れを検査
 │   └── security-policy.test.ts      #   絶対遵守ルールをコードレベル（AST）で強制
+├── docs/SECURITY_WHITEPAPER.md      # 暗号アーキテクチャ・2 段階消費 API・鍵確認値の技術詳細
+├── PRIVACY.md / TERMS.md / SECURITY.md  # プライバシーポリシー / 利用規約 / 脆弱性報告窓口（いずれもドラフト）
+├── .github/workflows/ci.yml         # main / develop への push・PR で npm run check → build → audit を実行
 ├── Dockerfile                       # マルチステージ（builder → runner）。USER node・HEALTHCHECK 付き
 ├── docker-compose.yml               # app（CipherDrop 本体）+ cloudflared（Cloudflare Tunnel）
 ├── .dockerignore
@@ -98,6 +110,29 @@ npm run check        # 型チェック + 全テスト（backend / frontend / tes
 npm run dev   # backend（:8787）と frontend（:5173）を 1 コマンドで並列起動する
 ```
 
+## CI
+
+`.github/workflows/ci.yml` が `main` / `develop` への push・PR のたびに `npm ci` → `npm run check`
+（型チェック + 全テスト）→ `npm run build`（全ワークスペース）→ `npm audit --audit-level=high` を実行する。
+いずれか 1 つでも失敗すれば、そのステップ以降を実行せずジョブ全体を失敗として報告する（既定の GitHub Actions の
+振る舞いで、`continue-on-error` は一切使っていない。`tests/ci-workflow.test.ts` がこれを検査している）。
+
+- サードパーティの Actions（`actions/checkout`・`actions/setup-node`）は可変なバージョンタグ（`@v4` 等）ではなく
+  コミット SHA に固定し、`GITHUB_TOKEN` の権限は `contents: read` だけに絞っている。
+- Node のバージョン（`24.x`）は `package.json` の `engines.node`・`Dockerfile` の `node:24-alpine` と
+  食い違っていないかを `tests/ci-workflow.test.ts` が突き合わせる（3 箇所がずれると壊れる：
+  `import.meta.main` 要件。README「Docker でのデプロイ」参照）。
+- このリポジトリの検証環境には GitHub Actions を実際に動かす手段が無いため、ワークフロー自体は
+  [`actionlint`](https://github.com/rhysd/actionlint)（v1.7.12、リリースの SHA-256 を照合して取得した単体バイナリ）
+  でも検査した。0 個の parse error / 0 個のルール違反（`shellcheck`・`pyflakes` の下位チェックは、それらの
+  外部コマンドが無い環境のため無効化された状態での結果）。ただし `actionlint` は `with:` に渡すキー名の
+  typo（例: `node-verzion`）までは検出しないことを確認したため、そこは `tests/ci-workflow.test.ts` 側の
+  厳密な文字列一致で担保している。**実際に GitHub 上で 1 回はワークフローを動かして確認すること。**
+- **このワークフローだけでは PR のマージは止まらない。** 失敗しても「チェックが赤くなる」だけで、GitHub が
+  マージ自体をブロックするには、リポジトリの Settings → Branches で `main` / `develop` にブランチ保護を設定し、
+  このジョブ（`Typecheck, test, build, audit`）を必須ステータスチェックに指定する必要がある（このリポジトリの
+  設定はコードの外側にあるので、`ci.yml` を置くだけでは行われない）。
+
 `dev` はシェルのジョブ制御（`&` / `wait`）で 2 つの `npm run dev --workspace ...` を同じプロセスグループで動かしている
 （npm の `run-script` 自体には複数ワークスペースを並列実行する機能が無いため）。Ctrl+C は両方に届き、一緒に終了する。
 ログを分けて見たい・個別に再起動したい場合は、従来どおり 2 つのターミナルで個別に起動できる:
@@ -117,13 +152,23 @@ API を手で試す例（本物のクライアントは暗号化するが、サ�
 
 ```bash
 IV=$(head -c 12 /dev/urandom | basenc --base64url | tr -d '=')
+
+# consumeSecret（消費の許可を示す秘密）は生バイト列を一時ファイルに置き、base64url 表現と
+# SHA-256（consumeVerifier）の両方をそこから導出する（同じバイト列を 2 通りに使うため）。
+SECRET_FILE=$(mktemp)
+head -c 32 /dev/urandom > "$SECRET_FILE"
+CONSUME_SECRET=$(basenc --base64url -w0 < "$SECRET_FILE" | tr -d '=')
+CONSUME_VERIFIER=$(sha256sum "$SECRET_FILE" | cut -d' ' -f1)
+rm -f "$SECRET_FILE"
+
 curl -s -X POST http://127.0.0.1:8787/api/payload \
   -H 'Content-Type: application/octet-stream' -H "X-CipherDrop-IV: $IV" \
   -H 'X-CipherDrop-Type: text' -H 'X-CipherDrop-TTL: 3600' \
+  -H "X-CipherDrop-Consume-Verifier: $CONSUME_VERIFIER" \
   --data-binary "$(head -c 64 /dev/urandom | base64 -w0 | head -c 64)"
 # → {"id":"<id>","expiresAt":"..."}
-# curl -s http://127.0.0.1:8787/api/payload/<id>/meta                 → {"type":"text","size":64,"expiresAt":"..."}（何度でも。消えない）
-# curl -s -X POST http://127.0.0.1:8787/api/payload/<id>/consume      → 1 回目 200（暗号文）、2 回目以降 404
+# curl -s http://127.0.0.1:8787/api/payload/<id>/meta                                                     → {"type":"text","size":64,"expiresAt":"..."}（何度でも。消えない）
+# curl -s -X POST http://127.0.0.1:8787/api/payload/<id>/consume -H "X-CipherDrop-Consume-Secret: $CONSUME_SECRET" → 1 回目 200（暗号文）、2 回目以降 404
 ```
 
 ## 画面
@@ -138,15 +183,21 @@ curl -s -X POST http://127.0.0.1:8787/api/payload \
 - 有効期限（1 時間・24 時間・7 日間）は素直な `<select>`。ボタンは「暗号化リンクを生成」。
 - 生成後は URL を等幅で全文表示し、**`#` 以降（復号鍵）を強調**して「この鍵はサーバーを経由していません」と注記する。「リンクをコピー」で全体をコピー。
 
-**受取・復号 (`/v/:id#key`)**
-1. **Stage 1（確認）**: 読み込み時に `GET …/meta` だけを呼ぶ。種類・サイズ・有効期限・暗号方式を等幅で示し、amber の静かな通知（`border-amber-500/20 bg-amber-500/5`）で
+**受取・復号 (`/v/:id#key.consumeSecret`)**
+0. **フラグメントの即時消去**: ページ読み込み時、`#` 以降をオンメモリに読み込んだ直後・最初のネットワーク
+   リクエストより前に `history.replaceState` でアドレスバー・履歴から消す（形式が不正なリンクでも消す）。
+   以後はこの画面のメモリ上にしか存在しない。**既知のトレードオフ**: 消去前は「確認段階でリロードしても
+   URL に残った鍵で再取得できる」復旧性があったが、消去後のリロードは元の共有リンクを開き直す必要がある
+   （`POST …/consume` の通信エラーによる再試行は、URL ではなくこの画面のメモリ上の値を使うため影響しない）。
+1. **Stage 1（確認）**: `GET …/meta` だけを呼ぶ。種類・サイズ・有効期限・暗号方式を等幅で示し、amber の静かな通知（`border-amber-500/20 bg-amber-500/5`）で
    「**このデータは一度開くとサーバーから永久削除されます**」と事実だけを伝える。**ここでは何も消費しない。**
    `meta.keyCheck` があり、URL の鍵から計算した値と一致しなければ、「開く」ボタン自体を出さず `POST …/consume` を発行しない
    （「鍵が一致しません」。詳細は「鍵確認値」の節）。
-2. **Stage 2（消費・復号）**: 「データを復号して表示」（ファイルは「データを復号してダウンロード」）を押したときだけ `POST …/consume`。
+2. **Stage 2（消費・復号）**: 「データを復号して表示」（ファイルは「データを復号してダウンロード」）を押したときだけ、
+   メモリ上の `consumeSecret` を `X-CipherDrop-Consume-Secret` ヘッダーに載せて `POST …/consume`（詳細は「消費用秘密鍵」の節）。
    テキストは `renderTextSafely`（テキストノード）で等幅のコードブロックに表示し、**「コピー」「破棄」**をワンクリックで実行できる。
    「破棄」は表示中のデータ（テキスト・ファイルのバイト列）への参照を手放して画面から消去する（サーバー上のデータは取得時に削除済みなので、再表示はできない）。
-   ファイルはダウンロードとして保存する。取得後はアドレスバーから鍵を消す。
+   ファイルはダウンロードとして保存する。
 
 **ブラウザには何も保存しない**（localStorage・sessionStorage・Cookie・IndexedDB を使わない。ポリシーテストで強制）。
 キーボード操作・支援技術への配慮（フォーカス管理・`aria-live`）、モバイル対応、日本語の文節単位の改行。
@@ -169,18 +220,18 @@ curl -s -X POST http://127.0.0.1:8787/api/payload \
 
 | | |
 | --- | --- |
-| `POST /api/payload` | 本文: 暗号文（`application/octet-stream`）。ヘッダー: `X-CipherDrop-IV`（必須・base64url の 12 バイト）、`X-CipherDrop-Type`（必須・`text` \| `file`）、`X-CipherDrop-TTL`（任意・秒。既定 86400、範囲 60〜604800）、`X-CipherDrop-Key-Check`（任意・16進小文字 8 桁。形式が不正なら黙って無視する）。→ `201 {"id","expiresAt"}` |
+| `POST /api/payload` | 本文: 暗号文（`application/octet-stream`）。ヘッダー: `X-CipherDrop-IV`（必須・base64url の 12 バイト）、`X-CipherDrop-Type`（必須・`text` \| `file`）、`X-CipherDrop-TTL`（任意・秒。既定 86400、範囲 60〜604800）、`X-CipherDrop-Key-Check`（任意・16進小文字 8 桁。形式が不正なら黙って無視する）、`X-CipherDrop-Consume-Verifier`（**必須**・consumeSecret の SHA-256 全体・16進小文字 64 桁）。→ `201 {"id","expiresAt"}` |
 | `GET /api/payload/:id/meta` | → `200 {"type","size","expiresAt","keyCheck"?}`（`size` は暗号文のバイト数。`keyCheck` は送信時に付いていた場合だけ現れる）。**何も消費・変更しない**。存在しない・消費済み・期限切れは `404`。 |
-| `POST /api/payload/:id/consume` | → `200` 暗号文 + `X-CipherDrop-IV`。**返す前にストアから完全に削除する**（アトミック）。存在しない・消費済み・期限切れは `404`。 |
+| `POST /api/payload/:id/consume` | ヘッダー: `X-CipherDrop-Consume-Secret`（**必須**・base64url の 32 バイト）。→ `200` 暗号文 + `X-CipherDrop-IV`。**consumeVerifier と一致した場合だけ、返す前にストアから完全に削除する**（アトミック・`crypto.timingSafeEqual` で比較）。存在しない・消費済み・期限切れ・consumeSecret 不一致は `404`（区別しない）。 |
 | `GET /api/payload/ping` | → `200 {"status":"ok"}`。ヘルスチェック専用。ストアには一切触れない。Docker の `HEALTHCHECK` が叩く。 |
 
 | ステータス | `error` | 条件 |
 | --- | --- | --- |
-| 400 | `invalid_iv` / `invalid_type` / `invalid_ttl` / `invalid_ciphertext` / `query_not_allowed` | 形式不正（暗号文は 16 バイト以上）。**クエリ文字列は一切受け付けない** |
-| 404 | `not_found` | 未発行・消費済み・期限切れ・旧 URL（区別しない） |
+| 400 | `invalid_iv` / `invalid_type` / `invalid_ttl` / `invalid_ciphertext` / `invalid_consume_verifier` / `content_length_mismatch` / `query_not_allowed` | 形式不正（暗号文は 16 バイト以上）。**クエリ文字列は一切受け付けない** |
+| 404 | `not_found` | 未発行・消費済み・期限切れ・consumeSecret 不一致・旧 URL（区別しない） |
 | 405 / 415 | `method_not_allowed` / `unsupported_media_type` | GET・HEAD 等で `consume` はできない（本体も返らない） |
 | 413 | `payload_too_large` | 既定 10 MiB 超 |
-| 503 | `storage_full` | 保存容量の上限（既定 512 MiB） |
+| 503 | `storage_full` | 保存容量（バイト数・件数のいずれか）の上限（既定 512 MiB・10 万件）。`Content-Length` の時点で予約できなければ本文を読まずに返す |
 
 ID は 128bit の乱数（base64url 22 文字）。全レスポンスに `Cache-Control: no-store` などを付け、CORS は許可しない（同一オリジン運用）。
 
@@ -217,25 +268,49 @@ ID は 128bit の乱数（base64url 22 文字）。全レスポンスに `Cache-
   意味の完全なゼロ知識ではなくなる。詳細な設計意図は `crypto.ts` の `generateKeyCheckTag` のコメントを参照。
 
 ```ts
-import { decryptPayload, encryptData, encryptFile, renderTextSafely } from './crypto.ts';
+import { decryptPayload, encryptData, encryptFile, generateConsumeSecret, parseShareFragment, renderTextSafely } from './crypto.ts';
 
 const { encryptedData, iv, keyString } = await encryptData(message);                    // string | ArrayBuffer
 const sealed = await encryptFile({ name: file.name, data: await file.arrayBuffer() });  // ファイル（名前ごと暗号化）
-const shareUrl = `${location.origin}/v/${id}#${keyString}`;                              // 鍵は # の後ろにだけ置く
+const { secretString, verifierHex } = await generateConsumeSecret();                    // consumeVerifier（送信）と consumeSecret（URL）
+const shareUrl = `${location.origin}/v/${id}#${keyString}.${secretString}`;             // 鍵・consumeSecret は # の後ろにだけ置く
 
-const payload = await decryptPayload(encrypted, iv, location.hash.slice(1));            // { type: 'text' | 'file' | 'binary', … }
+const fragment = parseShareFragment(location.hash.slice(1));                            // null なら形式不正（消費する前に止める）
+const payload = await decryptPayload(encrypted, iv, fragment!.keyString);               // { type: 'text' | 'file' | 'binary', … }
 if (payload.type === 'text') renderTextSafely(document.getElementById('out')!, payload.text); // innerHTML は使わない
 ```
 
 `tests/zero-knowledge.e2e.test.ts` の `sendSecret` / `receiveSecret` は、Node 専用 API を使わない API 層の利用サンプル。
 
+### 消費用秘密鍵（Consume Secret）
+
+ID（`/v/{id}` の `{id}`、128bit）は URL パスに載るため、サーバーのアクセスログ・ブラウザ履歴などから
+第三者に知られる可能性が、鍵（URL フラグメントにしか存在しない）より相対的に高い。**ID だけ**を知る
+第三者が `POST …/consume` を叩けば、正規の受信者より先にデータを破棄できてしまう（結果的に DoS になる）
+という構造的な弱点を閉じるための仕組み。
+
+- 送信時、復号鍵（`encKey`）とは**完全に独立**した 256bit の CSPRNG 値（`consumeSecret`）を新規生成し、
+  共有 URL のフラグメントに `#{encKey}.{consumeSecret}` として載せる（base64url は `.` を生成しないので、
+  区切りに使っても曖昧さがない。JWT が `.` を使うのと同じ理由）。
+- 作成リクエストでは、`consumeSecret` の **SHA-256 全体**（`consumeVerifier`、16進 64 桁）だけを
+  `X-CipherDrop-Consume-Verifier` として送る。サーバーは `consumeVerifier` を保存するが、`consumeSecret`
+  そのものを見ることはない。
+- 消費リクエストでは、URL から取り出した `consumeSecret` を `X-CipherDrop-Consume-Secret` として送る。
+  サーバーは受け取った値の SHA-256 を計算し、保存済みの `consumeVerifier` と `crypto.timingSafeEqual`
+  （タイミング攻撃対策）で比較し、**一致した場合だけ** `take()` を実行する。
+- 不一致・未発行・取得済み・期限切れは、**すべて同じ** `404`（区別しない）。ID だけを知る攻撃者に
+  「このヘッダーさえ整えれば何かが存在するか分かる」というオラクルを与えない。
+
+`crypto.ts` の `generateConsumeSecret` / `parseShareFragment`、`store.ts` の `take()` を参照。
+
 ## 絶対遵守ルールと、その検証
 
 | ルール | 実装 | 検証 |
 | --- | --- | --- |
-| 鍵は `#` にだけ置き、サーバーに送らない | `encryptData` は鍵を返すだけ。`api.ts` は鍵を受け取れず、ID も形式検証する。サーバーはクエリを拒否 | **E2E（API 層・UI 層）**: サーバーが受信した生 TCP バイトを全記録し、鍵・平文・ファイル名が生／hex／base64／部分列のどれでも現れないこと、受信リクエストが想定の本数だけでフラグメント・クエリ・Cookie が無いこと（鍵確認値ヘッダーを含めて検査する。鍵そのものではなく、鍵の一方向関数の出力の一部だけを送る設計上のトレードオフは「鍵確認値」の節を参照） |
+| 鍵は `#` にだけ置き、サーバーに送らない | `encryptData` は鍵を返すだけ。`api.ts` は鍵を受け取れず、ID も形式検証する。サーバーはクエリを拒否 | **E2E（API 層・UI 層）**: サーバーが受信した生 TCP バイトを全記録し、鍵・平文・ファイル名が生／hex／base64／部分列のどれでも現れないこと、受信リクエストが想定の本数だけでフラグメント・クエリ・Cookie が無いこと（鍵確認値・consumeVerifier ヘッダーを含めて検査する。鍵そのものではなく、鍵の一方向関数の出力の一部だけを送る設計上のトレードオフは「鍵確認値」の節を参照） |
 | Web Crypto の AES-GCM 256、IV は毎回生成 | `crypto.ts` | OpenSSL（`node:crypto`）との相互運用、200 回で鍵・IV・暗号文がすべて異なること、外部 import が無いこと |
-| 1 回読んだら即・物理削除（かつ、開く前には消えない） | `store.take()`（取得と削除が不可分）。`stat()` は副作用なし・戻り値の型に暗号文を含まない。`consume` は POST のみ | 削除が応答より先、50 並行 consume で成功 1 回、**GET / HEAD / OPTIONS / 旧 URL を浴びせても消えない**。読み込み時の処理が `consume` を呼ばないこと（実行時 + AST） |
+| 1 回読んだら即・物理削除（かつ、開く前には消えない） | `store.take(id, consumeSecret)`（取得・consumeSecret の検証・削除が不可分）。`stat()` は副作用なし・戻り値の型に暗号文を含まない。`consume` は POST のみ | 削除が応答より先、50 並行 consume で成功 1 回、**GET / HEAD / OPTIONS / 旧 URL を浴びせても消えない**。読み込み時の処理が `consume` を呼ばないこと（実行時 + AST） |
+| ID だけでは消費できない（consumeSecret の構造的分離） | `consumeSecret` は復号鍵と独立した 256bit の秘密で、URL フラグメントにしか存在しない。サーバーへ送るのは作成時に SHA-256 だけ、消費時に生の値だけ | **E2E**: 正しい ID・誤った consumeSecret の組では 404（削除されない）。誤り・未発行・期限切れのいずれも、ステータス・ヘッダー・本文まで区別できないこと |
 | XSS・ログ漏洩 | `renderTextSafely`（テキストノード）／DOM ビルダー（HTML 挿入なし・属性は許可リスト）／ログは固定スキーマ型のみ／厳格な CSP | XSS 文字列が要素にならないこと（jsdom・実ブラウザ）。`innerHTML` 等・`eval`・`console.*` を **AST で検査**。`setAttribute` は `dom.ts` だけ。**配布物にも** HTML 挿入 API・インライン・外部 URL が無いこと |
 
 実装を意図的に壊して（削除しない・GET でも消費・読み込み時に自動消費・`innerHTML` 化・鍵を API へ渡す・CSP を外す・外部フォントを読む …）
@@ -316,8 +391,12 @@ curl http://127.0.0.1:8080/api/payload/ping    # {"status":"ok"} が返ればロ
 4. **メタデータは見える。** 暗号文のサイズ、種別ヒント（text / file）、作成・期限・取得の時刻、鍵確認値（あれば・鍵の
    一方向関数の出力の 32bit）。パディングは未実装。
 5. **削除の意味。** ストアから削除してから応答する。メモリ／ディスクのゼロ埋めは保証しない（保持しているのは暗号文のみで、鍵は無い）。
-6. **インメモリ保存（MVP）。** 再起動すると未読の暗号文は消える。件数ではなく合計バイト数で上限を持つ。
-7. **認証・レート制限は未実装。** ID を知っていれば誰でも「消費」できる（DoS）。ID は推測不能だが、公開前にレート制限を入れること。
+6. **インメモリ保存（MVP）。** 再起動すると未読の暗号文は消える。合計バイト数・件数の両方で上限を持つ
+   （`Content-Length` の時点で予約できなければ、本文を読まずに `503` にする）。
+7. **ID だけでは「消費」できない（解決済み）。** かつては ID（128bit・URL パスに露出しうる）を知っていれば
+   誰でも `consume` を叩けたが、現在は復号鍵と独立した `consumeSecret`（URL フラグメントにしか存在しない）
+   の一致を要求する（「消費用秘密鍵」の節）。**認証（ユーザー識別）は引き続き未実装**で、IP 単位のレート制限
+   （nginx の `limit_conn` / `limit_req`）はあるが、多数の IP からの分散した連投までは防げない。
 8. **受け取るファイルは信頼できない。** 名前の無害化・保存形式の固定・実行ファイルへの注意喚起はするが、悪意あるファイルそのものは防げない。
 9. **ブラウザのメモリ。** JavaScript では鍵・平文のメモリ消去を保証できない。
 
@@ -338,6 +417,22 @@ curl http://127.0.0.1:8080/api/payload/ping    # {"status":"ok"} が返ればロ
   並列実行する機能が無い（`--parallel` のような公式フラグは存在しない）ため、シェルのジョブ制御
   （`cmd1 & cmd2 & wait`）で 2 つの `npm run dev --workspace ...` を同じプロセスグループで動かしている。
   Ctrl+C は両方に届く。
+
+## 法的文書・セキュリティ開示
+
+B2B 導入・OSS 展開に向けた文書一式。**いずれもドラフトであり、公開前に事業者情報（［　］の箇所）を
+埋め、弁護士等の専門家によるレビューを受けること。**
+
+| 文書 | 内容 |
+| --- | --- |
+| [`PRIVACY.md`](PRIVACY.md) | プライバシーポリシー。ゼロ知識設計による構造的な保証、収集しない情報（ゼロログ・Cookie 不使用）、保持するメタデータの範囲 |
+| [`TERMS.md`](TERMS.md) | 利用規約。一時配信サービスとしての性質、禁止事項、免責事項、鍵紛失時の復元不可能性 |
+| [`SECURITY.md`](SECURITY.md) | 脆弱性の報告窓口（Responsible Disclosure）・Safe Harbor・脅威モデルの要約。GitHub の Security タブから参照される |
+| [`docs/SECURITY_WHITEPAPER.md`](docs/SECURITY_WHITEPAPER.md) | 技術者向けセキュリティ・ホワイトペーパー。暗号アーキテクチャ・2 段階消費 API・鍵確認値の仕様とトレードオフを詳解 |
+| [`apps/frontend/public/.well-known/security.txt`](apps/frontend/public/.well-known/security.txt) | [RFC 9116](https://www.rfc-editor.org/rfc/rfc9116) 準拠。`https://cipherdrop.io/.well-known/security.txt` として配信される |
+
+これらの文書の存在・必須用語・リンク切れの有無は `tests/docs-integrity.test.ts` が機械的に検査する
+（見出しへのアンカーは GitHub の実際のスラッグ生成規則と照合済み）。
 
 ## 今後
 

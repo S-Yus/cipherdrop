@@ -6,8 +6,20 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_MAX_TTL_SECONDS, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_KEY_CHECK, HEADER_TTL, HEADER_TYPE } from '../apps/backend/src/server.ts';
 import {
+  DEFAULT_MAX_PAYLOAD_BYTES,
+  DEFAULT_MAX_TTL_SECONDS,
+  DEFAULT_TTL_SECONDS,
+  HEADER_CONSUME_SECRET,
+  HEADER_CONSUME_VERIFIER,
+  HEADER_IV,
+  HEADER_KEY_CHECK,
+  HEADER_TTL,
+  HEADER_TYPE,
+} from '../apps/backend/src/server.ts';
+import {
+  HEADER_CONSUME_SECRET as CLIENT_HEADER_CONSUME_SECRET,
+  HEADER_CONSUME_VERIFIER as CLIENT_HEADER_CONSUME_VERIFIER,
   HEADER_IV as CLIENT_HEADER_IV,
   HEADER_KEY_CHECK as CLIENT_HEADER_KEY_CHECK,
   HEADER_TTL as CLIENT_HEADER_TTL,
@@ -29,7 +41,7 @@ function browse(world: World, url: string) {
     api: {
       createPayload: (input) => client.createPayload(input),
       getMeta: (id) => client.getMeta(id),
-      consume: (id) => client.consume(id),
+      consume: (id, consumeSecret) => client.consume(id, consumeSecret),
     },
   });
   mountApp(t.env);
@@ -57,7 +69,7 @@ describe('UI E2E: テキストの共有', () => {
   it('送信 → 確認画面 → 開く → 復号表示 まで通しで動き、消費されるのは「開く」を押した時だけ', async (t) => {
     const world = await startWorld(t);
     const link = await shareText(world, secret);
-    assert.match(link, /^https:\/\/cipherdrop\.io\/v\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}$/);
+    assert.match(link, /^https:\/\/cipherdrop\.io\/v\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/);
     assert.equal(world.store.size, 1);
 
     const receiver = browse(world, link);
@@ -65,20 +77,22 @@ describe('UI E2E: テキストの共有', () => {
     assert.match(receiver.main.textContent ?? '', /このデータは一度開くとサーバーから永久削除されます/);
     assert.equal(world.store.takes.length, 0, '確認画面の表示では消費されない');
     assert.equal(world.store.size, 1);
+    assert.equal(receiver.window.location.hash, '', 'ページ読み込み時点で既にアドレスバーから鍵が消えている（プライバシー保護のため即時消去）');
 
     clickOpen(receiver);
     const output = await waitFor(() => receiver.main.querySelector('[data-testid="decrypted-text"]'));
     assert.equal(output.textContent, secret);
     assert.equal(output.children.length, 0, 'HTML として解釈されていない');
-    assert.equal(receiver.window.location.hash, '', '消費後は、アドレスバーから鍵が消える');
+    assert.equal(receiver.window.location.hash, '', '消費後も、引き続きアドレスバーに鍵は無い');
     assert.equal(world.store.size, 0, 'サーバーには何も残らない');
     assert.equal(world.store.takes.length, 1);
   });
 
-  it('サーバーが受け取った生の通信・保存・ログのどこにも、鍵・平文は現れない（UI が送っていない）', async (t) => {
+  it('サーバーが受け取った生の通信・保存・ログのどこにも、鍵・consumeSecret（生の値）・平文は現れない（UI が送っていない）', async (t) => {
     const world = await startWorld(t);
     const link = await shareText(world, secret);
-    const keyString = link.split('#')[1] ?? '';
+    const [keyString, consumeSecretString] = (link.split('#')[1] ?? '').split('.');
+    assert.ok(keyString && consumeSecretString);
     const id = new URL(link).pathname.split('/').pop() ?? '';
 
     const receiver = browse(world, link);
@@ -94,16 +108,22 @@ describe('UI E2E: テキストの共有', () => {
       'UI が送ったリクエストは、この 3 本だけ',
     );
 
-    const [upload] = requests;
+    const [upload, , consume] = requests;
     const stored = world.store.puts[0];
-    assert.ok(upload && stored);
+    assert.ok(upload && consume && stored);
     assert.deepEqual(new Uint8Array(upload.body), stored.ciphertext, 'アップロード本文は暗号文そのもの');
     assert.equal(upload.headers.get(HEADER_TYPE), 'text');
     assert.equal(upload.headers.get(HEADER_TTL), String(DEFAULT_TTL_SECONDS));
+    assert.equal(upload.headers.get(HEADER_CONSUME_VERIFIER), Buffer.from(stored.consumeVerifier).toString('hex'), 'consumeVerifier は作成リクエストのヘッダーに現れる');
+    assert.equal(consume.headers.get(HEADER_CONSUME_SECRET), consumeSecretString, 'consumeSecret 自体は消費リクエストのヘッダーにだけ現れる');
 
     const rawKey = Buffer.from(keyString, 'base64url');
     assert.deepEqual(leakedForms(observed, rawKey, '鍵'), []);
     for (let i = 0; i + 12 <= keyString.length; i++) assert.ok(!observed.toString('latin1').includes(keyString.slice(i, i + 12)), `鍵の一部 (${i}〜)`);
+    // consumeSecret は consume リクエストのヘッダーにだけ現れてよい（上で確認済み）ので、それ以外の
+    // リクエスト（作成・meta）には現れないことだけを確認する（鍵と違い「通信のどこにも現れない」わけではない）。
+    const observedWithoutConsume = Buffer.concat(requests.filter((r) => r !== consume).map((r) => Buffer.concat([Buffer.from(r.head, 'latin1'), r.body])));
+    assert.deepEqual(leakedForms(observedWithoutConsume, Buffer.from(consumeSecretString, 'base64url'), 'consumeSecret'), []);
     assert.deepEqual(leakedForms(observed, Buffer.from(secret), '平文'), []);
     for (const fragment of ['123456789012', 'top-secret-passphrase', '口座', 'onerror']) assert.ok(!observed.includes(fragment), fragment);
 
@@ -112,7 +132,7 @@ describe('UI E2E: テキストの共有', () => {
     assert.equal(requests.some((r) => r.headers.has('cookie') || r.headers.has('referer')), false, 'Cookie・Referer を送らない');
 
     const logText = JSON.stringify(world.logs);
-    for (const value of [keyString, id, 'top-secret-passphrase']) assert.ok(!logText.includes(value), 'ログに機密がない');
+    for (const value of [keyString, consumeSecretString, id, 'top-secret-passphrase']) assert.ok(!logText.includes(value), 'ログに機密がない');
   });
 
   it('リンクプレビュー・スキャナ（JS を実行して meta を叩く）が何度来ても消えず、受信者は最後まで開ける', async (t) => {
@@ -300,6 +320,8 @@ describe('フロントエンドとバックエンドの契約（定数の整合�
     assert.equal(CLIENT_HEADER_TTL.toLowerCase(), HEADER_TTL);
     assert.equal(CLIENT_HEADER_TYPE.toLowerCase(), HEADER_TYPE);
     assert.equal(CLIENT_HEADER_KEY_CHECK.toLowerCase(), HEADER_KEY_CHECK);
+    assert.equal(CLIENT_HEADER_CONSUME_VERIFIER.toLowerCase(), HEADER_CONSUME_VERIFIER);
+    assert.equal(CLIENT_HEADER_CONSUME_SECRET.toLowerCase(), HEADER_CONSUME_SECRET);
   });
 
   it('画面から見えるページ内の要素は、UI の外へ何も読み込まない（img / script / link / iframe が 0）', async (t) => {
