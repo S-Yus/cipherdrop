@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CipherDrop</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">CipherDrop</a>
+      <p class="tagline">ブラウザで暗号化し、1 回読んだら消える共有リンク</p>
+    </header>
+
+    <main>
+      <noscript><p class="card notice">CipherDrop はブラウザ内で暗号化するため、JavaScript を有効にしてください。</p></noscript>
+
+      <!-- 送信 -->
+      <section id="compose" class="card" hidden>
+        <h1>安全に送る</h1>
+        <form id="compose-form" novalidate>
+          <div class="tabs" role="tablist">
+            <button type="button" id="tab-text" role="tab" aria-selected="true" aria-controls="panel-text">テキスト</button>
+            <button type="button" id="tab-file" role="tab" aria-selected="false" aria-controls="panel-file">ファイル</button>
+          </div>
+
+          <div id="panel-text" role="tabpanel">
+            <label for="message" class="visually-hidden">メッセージ</label>
+            <textarea id="message" rows="8" placeholder="パスワードや機密情報などを入力" autocomplete="off" spellcheck="false"></textarea>
+          </div>
+
+          <div id="panel-file" role="tabpanel" hidden>
+            <label for="file" class="file-drop">
+              <span>ファイルを選択（最大 約 10 MB）</span>
+              <input type="file" id="file" />
+            </label>
+            <p id="file-info" class="muted"></p>
+          </div>
+
+          <div class="row">
+            <label for="ttl">有効期限</label>
+            <select id="ttl">
+              <option value="3600">1 時間</option>
+              <option value="86400" selected>24 時間</option>
+              <option value="604800">7 日間</option>
+            </select>
+          </div>
+
+          <button type="submit" id="submit" class="primary">暗号化してリンクを作成</button>
+          <p id="compose-status" class="status" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <!-- 作成完了 -->
+      <section id="created" class="card" hidden>
+        <h1>リンクを作成しました</h1>
+        <p>このリンクを相手に共有してください。<strong>1 回開くと内容は削除され</strong>、二度と表示できません。</p>
+        <div class="copy-row">
+          <label for="share-url" class="visually-hidden">共有リンク</label>
+          <input id="share-url" type="text" readonly />
+          <button type="button" data-copy-target="share-url">コピー</button>
+        </div>
+        <p class="muted">有効期限: <span id="expires-at"></span>（未開封のまま期限を過ぎると削除されます）</p>
+        <p class="muted">復号の鍵はリンクの <code>#</code> 以降にだけ含まれ、サーバーには送られません。リンクをなくすと誰にも復元できません。</p>
+        <button type="button" id="again">もう 1 つ作成する</button>
+      </section>
+
+      <!-- 受信: 開封前 -->
+      <section id="reveal" class="card" hidden>
+        <h1>暗号化されたメッセージが届いています</h1>
+        <p>表示すると、内容はサーバーから<strong>完全に削除</strong>されます。表示は 1 回限りなので、必要なら控えを取ってください。</p>
+        <button type="button" id="reveal-button" class="primary">表示する</button>
+        <p id="reveal-status" class="status" role="status" aria-live="polite"></p>
+        <p class="muted">このページを再読み込みすると鍵が失われ、表示できなくなります。</p>
+      </section>
+
+      <!-- 受信: 開封後 -->
+      <section id="result" class="card" hidden>
+        <h1>メッセージ</h1>
+        <div id="result-text" hidden>
+          <pre id="result-message" class="message"></pre>
+          <button type="button" id="copy-message">コピー</button>
+        </div>
+        <div id="result-file" hidden>
+          <p id="result-file-name"></p>
+          <a id="download" class="button primary" href="#">ダウンロード</a>
+        </div>
+        <p class="muted">この内容はサーバーから削除済みです。このページを閉じると二度と表示できません。</p>
+      </section>
+
+      <!-- エラー -->
+      <section id="failure" class="card" hidden>
+        <h1>表示できません</h1>
+        <p id="failure-message"></p>
+        <a class="button" href="/">新しく作成する</a>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>暗号化と復号はすべてブラウザ内（AES-GCM 256bit）で行われ、サーバーは暗号文しか保持しません。</p>
+    </footer>
+  </body>
+</html>

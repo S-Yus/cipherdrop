@@ -5,6 +5,7 @@
   "description": "CipherDrop client: all encryption and decryption happens in the browser (Web Crypto API).",
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node --input-type=module -e \"import { cpSync } from 'node:fs'; cpSync('public', 'dist', { recursive: true });\"",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
     "test": "node --test \"src/**/*.test.ts\""
   },

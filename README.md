@@ -37,11 +37,16 @@ https://cipherdrop.io/v/{id}#{key}
 cipherdrop/
 ├── apps/
 │   ├── frontend/                  # クライアント（暗号化・復号・安全な描画）
-│   │   └── src/crypto.ts          #   encryptData / decryptData / renderTextSafely
+│   │   ├── public/                #   index.html・style.css（ビルドで dist/ にコピー）
+│   │   └── src/
+│   │       ├── crypto.ts          #   encryptData / decryptData / renderTextSafely
+│   │       ├── envelope.ts        #   ファイル名・MIME も暗号化するファイルエンベロープ
+│   │       └── app.ts             #   送信・受信画面
 │   └── backend/                   # API サーバー（ランタイム依存 0）
 │       └── src/
 │           ├── server.ts          #   POST /api/payload, GET /api/payload/:id
 │           └── store.ts           #   暗号文ストア（take = 取得と削除が不可分）
+├── deploy/nginx/                  # 画面の配信・API への転送・CSP などのヘッダー
 ├── tests/                         # アプリ横断のテスト
 │   ├── zero-knowledge.e2e.test.ts #   E2E 証明 + フロントエンド向け利用サンプル
 │   └── security-policy.test.ts    #   絶対遵守ルールをコードレベルで強制
@@ -74,8 +79,13 @@ curl -si -X POST http://127.0.0.1:8787/api/payload \
 ### Docker でのデプロイ
 
 ```bash
-docker compose up -d --build   # API サーバーを 127.0.0.1:8080 で起動（外部には直接公開しない）
+docker compose up -d --build   # 画面 + API を 127.0.0.1:8080 で起動（外部には直接公開しない）
 ```
+
+- `web`（nginx）が画面を配信し、`/api/` を `api` コンテナへ転送する（再送は無効）。ログに URL・IP は出さない。
+- `api` は compose の内部ネットワークにだけ置き、ホストには公開しない。
+- 画面には厳格な CSP（外部リソース全拒否・Trusted Types）を付けている。Cloudflare の Rocket Loader や
+  Email Obfuscation などスクリプトを挿入する機能は CSP で止まるので無効にしておくこと。
 
 外部公開は同じホスト上の Cloudflare Tunnel（cloudflared）から `http://localhost:8080` へ転送する。
 cloudflared は `network_mode: host` で動かすこと（ブリッジネットワークだと `localhost` がコンテナ自身を指す）。

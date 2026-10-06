@@ -1,31 +1,51 @@
 # 使い方: docker compose up -d --build
 #
-# アプリはホストの 127.0.0.1:8080 にだけ公開する（外部からは直接届かない）。
+#   web : 画面の配信と /api/ の転送（nginx）。ホストの 127.0.0.1:8080 にだけ公開する（外部からは直接届かない）
+#   api : API サーバー。compose の内部ネットワークにだけ置き、web からしか届かない
+#
 # 外部公開は同じホスト上の cloudflared（Cloudflare Tunnel）が http://localhost:8080 へ転送して行う。
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
-  cipherdrop:
+  api:
+    <<: *hardening
     build:
       context: .
       dockerfile: Dockerfile
-    image: cipherdrop-backend:latest
-    container_name: cipherdrop
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
+      target: api
+    image: cipherdrop-api:latest
+    container_name: cipherdrop-api
     environment:
-      # アプリにはトンネル（cloudflared）経由でしか届かないので、Cloudflare が付ける実 IP ヘッダーを信頼してよい。
+      # アプリにはトンネル（cloudflared）→ web 経由でしか届かないので、Cloudflare が付ける実 IP ヘッダーを信頼してよい。
       # レート制限を IP ごとに数えるために使う（未対応の版では無視される）。
       - CLIENT_IP_HEADER=cf-connecting-ip
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+  web:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    image: cipherdrop-web:latest
+    container_name: cipherdrop-web
+    ports:
+      - "127.0.0.1:8080:8080"
+    tmpfs:
+      - /tmp
+    depends_on:
+      api:
+        condition: service_healthy
 
   # 任意: cloudflared もこの compose で管理する場合だけ使う。
   #   1) .env に TUNNEL_TOKEN=... を書く（.env はコミットしない）
@@ -41,4 +61,4 @@ services:
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN:-}
     depends_on:
-      - cipherdrop
+      - web
