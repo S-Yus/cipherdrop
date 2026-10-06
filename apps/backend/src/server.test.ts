@@ -4,7 +4,7 @@ import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { describe, it } from 'node:test';
 import type { TestContext } from 'node:test';
-import { createServer, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_TTL } from './server.ts';
+import { createServer, DEFAULT_RATE_LIMITS, DEFAULT_TTL_SECONDS, HEADER_IV, HEADER_TTL } from './server.ts';
 import type { LogEvent, ServerOptions } from './server.ts';
 import { InMemoryPayloadStore } from './store.ts';
 import type { InMemoryStoreOptions, StoredPayload } from './store.ts';
@@ -79,7 +79,8 @@ async function startHarness<S extends RecordingStore = RecordingStore>(
   const storeOptions: InMemoryStoreOptions = { now: () => now, sweepIntervalMs: 0, ...config.storeOptions };
   const store = config.createStore ? config.createStore(storeOptions) : (new RecordingStore(storeOptions) as S);
   const logs: LogEvent[] = [];
-  const server = createServer({ store, log: (event) => logs.push(event), ...config.server });
+  // レート制限は専用のテスト以外では無効にする（並行リクエストなどの検査を妨げないように）
+  const server = createServer({ store, log: (event) => logs.push(event), rateLimits: false, now: () => now, ...config.server });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
@@ -501,6 +502,80 @@ describe('GET /api/payload/:id', () => {
 // ---------------------------------------------------------------------------
 // セキュリティヘッダー・ログ
 // ---------------------------------------------------------------------------
+
+describe('レート制限', () => {
+  const rateLimits = {
+    create: { capacity: 2, refillPerSecond: 1 / 10 },
+    consume: { capacity: 3, refillPerSecond: 1 },
+  };
+
+  it('保存は上限を超えると 429 rate_limited（Retry-After 付き）で、何も保存しない。時間が経てば回復する', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits } });
+    await createSecret(h);
+    await createSecret(h);
+
+    const limited = await postPayload(h);
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get('retry-after'), '10');
+    assert.deepEqual(await limited.json(), { error: 'rate_limited' });
+    assert.equal(h.store.puts.length, 2);
+
+    h.advanceClock(10_000);
+    await createSecret(h);
+    assert.equal(h.store.puts.length, 3);
+  });
+
+  it('取得は上限を超えると 429 で、暗号文を消費しない（ストアに触れない）', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits } });
+    const secret = await createSecret(h);
+    for (let i = 0; i < 3; i++) assert.equal((await getPayload(h, 'A'.repeat(22))).status, 404);
+
+    const limited = await getPayload(h, secret.id);
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get('retry-after'), '1');
+    assert.equal(h.store.takes.length, 3);
+
+    h.advanceClock(1000);
+    assert.equal((await getPayload(h, secret.id)).status, 200);
+  });
+
+  it('保存と取得は別々のバケットで数える。405 などメソッド違いは数えない', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits } });
+    for (let i = 0; i < 5; i++) assert.equal((await fetch(`${h.baseUrl}/api/payload`)).status, 405);
+    await createSecret(h);
+    await createSecret(h);
+    for (let i = 0; i < 3; i++) assert.equal((await getPayload(h, 'A'.repeat(22))).status, 404);
+  });
+
+  it('clientIpHeader を指定すると、そのヘッダーの IP ごとに数える（IPv6 は /64 単位）', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits, clientIpHeader: 'cf-connecting-ip' } });
+    const as = (ip: string) => ({ 'cf-connecting-ip': ip });
+    await createSecret(h, as('203.0.113.1'));
+    await createSecret(h, as('203.0.113.1'));
+    assert.equal((await postPayload(h, makeUpload(), as('203.0.113.1'))).status, 429);
+    assert.equal((await postPayload(h, makeUpload(), as('203.0.113.2'))).status, 201);
+
+    await createSecret(h, as('2001:db8:1:2::1'));
+    await createSecret(h, as('2001:db8:1:2:ffff::9'));
+    assert.equal((await postPayload(h, makeUpload(), as('2001:db8:1:2:abcd::1'))).status, 429);
+    assert.equal((await postPayload(h, makeUpload(), as('2001:db8:1:3::1'))).status, 201);
+  });
+
+  it('clientIpHeader の値が IP でなければ、接続元アドレスで数える', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits, clientIpHeader: 'cf-connecting-ip' } });
+    await createSecret(h, { 'cf-connecting-ip': 'not-an-ip' });
+    await createSecret(h, { 'cf-connecting-ip': 'evil, 1.2.3.4' });
+    assert.equal((await postPayload(h)).status, 429); // ヘッダー無し = 同じ接続元 127.0.0.1
+  });
+
+  it('既定で有効になっている', async (t) => {
+    const h = await startHarness(t, { server: { rateLimits: DEFAULT_RATE_LIMITS } });
+    const statuses = [];
+    for (let i = 0; i < DEFAULT_RATE_LIMITS.create.capacity + 1; i++) statuses.push((await postPayload(h)).status);
+    assert.equal(statuses.at(-1), 429);
+    assert.equal(statuses.filter((s) => s === 201).length, DEFAULT_RATE_LIMITS.create.capacity);
+  });
+});
 
 describe('レスポンスヘッダー', () => {
   it('成功・失敗を問わず、キャッシュ禁止などのセキュリティヘッダーを付け、CORS は許可しない', async (t) => {
