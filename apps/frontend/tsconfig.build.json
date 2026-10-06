@@ -1,0 +1,12 @@
+{
+  // ブラウザ配信用のビルド。dist/ に public/ の静的ファイルと、src/ をコンパイルした JS（assets/）を置く。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/assets",
+    "rootDir": "src",
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}
