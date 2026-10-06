@@ -1,0 +1,40 @@
+# 使い方: docker compose up -d --build
+#
+# アプリはホストの 127.0.0.1:8080 にだけ公開する（外部からは直接届かない）。
+# 外部公開は同じホスト上の cloudflared（Cloudflare Tunnel）が http://localhost:8080 へ転送して行う。
+services:
+  cipherdrop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cipherdrop-backend:latest
+    container_name: cipherdrop
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 任意: cloudflared もこの compose で管理する場合だけ使う。
+  #   1) .env に TUNNEL_TOKEN=... を書く（.env はコミットしない）
+  #   2) 既存の cloudflared コンテナを止めてから: docker compose --profile tunnel up -d
+  # network_mode: host なので、トンネル側の転送先 localhost:8080 がホストの 8080 を指す。
+  cloudflared:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    network_mode: host
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:-}
+    depends_on:
+      - cipherdrop

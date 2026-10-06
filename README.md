@@ -71,6 +71,16 @@ curl -si -X POST http://127.0.0.1:8787/api/payload \
 
 本番用は `npm run build -w @cipherdrop/backend` → `node apps/backend/dist/server.js`。
 
+### Docker でのデプロイ
+
+```bash
+docker compose up -d --build   # API サーバーを 127.0.0.1:8080 で起動（外部には直接公開しない）
+```
+
+外部公開は同じホスト上の Cloudflare Tunnel（cloudflared）から `http://localhost:8080` へ転送する。
+cloudflared は `network_mode: host` で動かすこと（ブリッジネットワークだと `localhost` がコンテナ自身を指す）。
+cloudflared も compose で管理する場合は `.env` に `TUNNEL_TOKEN` を書き、`docker compose --profile tunnel up -d`。
+
 ## API
 
 | | |
