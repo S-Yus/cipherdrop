@@ -12,6 +12,8 @@
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { clientKey, RateLimiter } from './ratelimit.ts';
+import type { RateLimitRule } from './ratelimit.ts';
 import { InMemoryPayloadStore, StoreFullError } from './store.ts';
 import type { PayloadStore } from './store.ts';
 
@@ -34,6 +36,12 @@ const MIN_TTL_SECONDS = 60;
 export const DEFAULT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 export const DEFAULT_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/** クライアント（IP）ごとの既定のレート制限。保存は 10 回まで連続、以後 6 秒に 1 回。取得は 30 回まで連続、以後 1 秒に 1 回。 */
+export const DEFAULT_RATE_LIMITS: RateLimits = {
+  create: { capacity: 10, refillPerSecond: 1 / 6 },
+  consume: { capacity: 30, refillPerSecond: 1 },
+};
 
 /** すべてのレスポンスに付ける。API は HTML を返さないので CSP は全拒否。CORS は意図的に許可しない。 */
 const BASE_HEADERS = {
@@ -86,6 +94,20 @@ export interface ServerOptions {
   defaultTtlSeconds?: number;
   maxTtlSeconds?: number;
   log?: (event: LogEvent) => void;
+  /** クライアントごとのレート制限。false で無効（テスト用）。 */
+  rateLimits?: RateLimits | false;
+  /**
+   * クライアントの IP を取るヘッダー（例: 'cf-connecting-ip'）。省略時は接続元アドレスを使う。
+   * 偽装できるヘッダーなので、プロキシ／トンネル経由でしかアプリに届かない構成のときだけ指定すること。
+   */
+  clientIpHeader?: string;
+  /** レート制限の時刻（epoch ms）。テストで差し替える。 */
+  now?: () => number;
+}
+
+export interface RateLimits {
+  create: RateLimitRule;
+  consume: RateLimitRule;
 }
 
 interface Context {
@@ -94,15 +116,24 @@ interface Context {
   defaultTtlSeconds: number;
   maxTtlSeconds: number;
   log: (event: LogEvent) => void;
+  limiters: { create: RateLimiter; consume: RateLimiter } | null;
+  clientIpHeader: string | undefined;
 }
 
 export function createServer(options: ServerOptions = {}): Server {
   const writeLog = options.log ?? writeLogLine;
+  const rateLimits = options.rateLimits ?? DEFAULT_RATE_LIMITS;
+  const now = options.now ?? Date.now;
   const context: Context = {
     store: options.store ?? new InMemoryPayloadStore(),
     maxPayloadBytes: options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES,
     defaultTtlSeconds: options.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS,
     maxTtlSeconds: options.maxTtlSeconds ?? DEFAULT_MAX_TTL_SECONDS,
+    limiters:
+      rateLimits === false
+        ? null
+        : { create: new RateLimiter({ ...rateLimits.create, now }), consume: new RateLimiter({ ...rateLimits.consume, now }) },
+    clientIpHeader: options.clientIpHeader,
     // ロギングの失敗でリクエスト処理を止めず、プロセスも落とさない。
     // このサーバーは未読の暗号文をメモリに抱えているため、プロセス停止は未読データの全消失を意味する。
     log: (event) => {
@@ -163,7 +194,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, context: Cont
   if (target === CREATE_PATH) {
     if (req.method !== 'POST') {
       sendError(res, 405, 'method_not_allowed', { Allow: 'POST' });
-    } else {
+    } else if (allowRequest(req, res, context, 'create')) {
       await createPayload(req, res, context);
     }
     return 'create';
@@ -174,7 +205,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, context: Cont
     // GET だけを受け付ける。HEAD などを GET と同一視すると、プロキシの疎通確認で暗号文が消えてしまう。
     if (req.method !== 'GET') {
       sendError(res, 405, 'method_not_allowed', { Allow: 'GET' });
-    } else {
+    } else if (allowRequest(req, res, context, 'consume')) {
       await consumePayload(res, id, context);
     }
     return 'consume';
@@ -182,6 +213,19 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, context: Cont
 
   sendError(res, 404, 'not_found');
   return 'unmatched';
+}
+
+/**
+ * レート制限を超えていたら 429 を返して false。本文を読む前・ストアに触れる前に判定するので、拒否したリクエストは
+ * 何も保存せず、暗号文も消費しない。Connection: close なのは、上限超過の本文を読まずに捨てるため。
+ */
+function allowRequest(req: IncomingMessage, res: ServerResponse, context: Context, route: 'create' | 'consume'): boolean {
+  if (context.limiters === null) return true;
+  const { allowed, retryAfterSeconds } = context.limiters[route].take(clientKey(req, context.clientIpHeader));
+  if (!allowed) {
+    sendError(res, 429, 'rate_limited', { 'Retry-After': String(retryAfterSeconds), Connection: 'close' });
+  }
+  return allowed;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +340,11 @@ if (import.meta.main) {
   const host = process.env['HOST'] ?? '127.0.0.1';
   const port = readPort(process.env['PORT']);
 
+  // 例: トンネル（cloudflared）経由でしか届かない構成なら CLIENT_IP_HEADER=cf-connecting-ip
+  const clientIpHeader = process.env['CLIENT_IP_HEADER'] || undefined;
+
   const store = new InMemoryPayloadStore();
-  const server = createServer({ store });
+  const server = createServer({ store, ...(clientIpHeader === undefined ? {} : { clientIpHeader }) });
 
   server.listen(port, host, () => {
     const address = server.address();
